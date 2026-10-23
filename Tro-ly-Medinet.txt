@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trợ lý Medinet
 // @namespace    VietsDragon/AutoFixMediNet
-// @version      1.0.0
+// @version      1.0.1
 // @description  Tích hợp điền hồ sơ, CLS và kết luận; xác minh đúng lượt, checkpoint và đọc lại sau lưu.
 // @author       Trần Xuân Cường; tích hợp theo yêu cầu người dùng
 // @match        https://quanlyskcd.medinet.org.vn/*
@@ -1897,6 +1897,33 @@
     }
   };
 
+  // src/tasks.js
+  function actionsFor(context) {
+    if (!context) return [];
+    const { model, page } = context;
+    if (page === "list") {
+      if (["M3", "M4"].includes(model))
+        return [{ value: "batchCls", label: `AUTO CLS + Kết luận ${model}` }];
+      if (["M2", "M11"].includes(model))
+        return [{ value: "batchConclusion", label: `AUTO Kết luận ${model}` }];
+      return [];
+    }
+    if (page === "conclusion")
+      return [{ value: "auto", label: "Soạn đề nghị khám" }];
+    if (page === "cls" && ["M3", "M4"].includes(model))
+      return [{ value: "auto", label: `AUTO ${model} · Cận lâm sàng` }];
+    if (["M2", "M3", "M4", "M5", "M6"].includes(model) && ["history", "mental", "questions", "clinical"].includes(page))
+      return [{ value: "auto", label: `AUTO ${model} · Mục đang mở` }];
+    return [];
+  }
+  function operationFor(context) {
+    if (!actionsFor(context).some((a) => a.value === "auto"))
+      fail("CONTEXT", "Mở mục được AUTO hỗ trợ trên hồ sơ trước khi chạy.");
+    if (context.page === "cls") return "cls";
+    if (context.page === "conclusion") return "proposal";
+    return "fill";
+  }
+
   // src/context.js
   var LISTS = {
     M2: "KSKDK_DanhSach_KSK_M12",
@@ -2209,14 +2236,22 @@
   var writable = (el) => visible(el) && !el.disabled && !el.readOnly && el.getAttribute("aria-disabled") !== "true" && !el.closest('.dx-state-disabled,[aria-disabled="true"]') && el.type !== "file";
   var read = (el) => "value" in el ? String(el.value ?? "") : el.textContent || "";
   var labelKey = (value) => headerKey(value).replace(/\s*\(\s*/g, "(").replace(/\s*\)/g, ")");
-  function field(root, names, { optional = false } = {}) {
+  function field(root, names, { optional = false, forRead = false } = {}) {
+    const usable = forRead ? visible : writable;
     const wanted = names.map(labelKey), found = /* @__PURE__ */ new Set();
-    const controls = all(root, CONTROL).filter(writable);
-    const named = controls.filter(
+    const controls2 = all(root, CONTROL).filter(usable);
+    const named = controls2.filter(
       (c) => wanted.includes(labelKey(c.getAttribute("aria-label") || "")) || wanted.includes(labelKey(c.name || "")) || wanted.includes(labelKey(c.id || ""))
     );
     if (named.length === 1) return named[0];
     if (named.length > 1) fail("UI_CHANGED", "Nhiều control cùng tên.");
+    const sourceParameter = wanted.includes("cccd") ? "KSKDK_DinhDanhCaNhan" : wanted.includes("ho ten") ? "HoTen" : null;
+    if (sourceParameter) {
+      const stable = controls2.filter(
+        (c) => c.name === sourceParameter || c.id.endsWith("_" + sourceParameter) || sourceParameter === "HoTen" && /(?:^|_)HoTen$/.test(c.name)
+      );
+      if (stable.length) return unique(stable, "Tham số " + sourceParameter);
+    }
     const labels = all(
       root,
       "label,b,strong,span,.control-label,.dx-field-item-label-text"
@@ -2229,12 +2264,12 @@
       const id = label.getAttribute("for");
       const linked = id ? label.ownerDocument.getElementById(id) : null;
       if (linked && root.contains(linked)) {
-        if (writable(linked) && linked.matches(CONTROL)) {
+        if (usable(linked) && linked.matches(CONTROL)) {
           found.add(linked);
           continue;
         }
         if (visible(linked)) {
-          const c = all(linked, CONTROL).filter(writable);
+          const c = all(linked, CONTROL).filter(usable);
           if (c.length === 1) {
             found.add(c[0]);
             continue;
@@ -2243,7 +2278,7 @@
       }
       let p = label.parentElement;
       for (let d = 0; d < 5 && p && root.contains(p); d++, p = p.parentElement) {
-        const c = all(p, CONTROL).filter(writable);
+        const c = all(p, CONTROL).filter(usable);
         if (c.length === 1) {
           found.add(c[0]);
           break;
@@ -2337,12 +2372,12 @@
     const leaf = nodes.filter(
       (n) => !nodes.some((c) => c !== n && n.contains(c))
     );
-    const controls = leaf.map(
+    const controls2 = leaf.map(
       (n) => n.closest(
         '.dx-list-item,[role="radio"],[role="checkbox"],.dx-radiobutton'
       ) || n.querySelector('input[type="checkbox"],input[type="radio"]') || n
     );
-    return unique(controls, "Lựa chọn " + label);
+    return unique(controls2, "Lựa chọn " + label);
   }
   async function choose(find, { guard, signal } = {}) {
     check(signal);
@@ -2445,7 +2480,7 @@
     };
   }
   async function writeDate(find, raw, { guard, signal } = {}) {
-    const wanted = date(raw);
+    const wanted = String(raw ?? "").trim() ? date(raw) : "";
     guard();
     check(signal);
     const getInstance = (el) => {
@@ -2460,20 +2495,25 @@
     };
     const instance = getInstance(find());
     if (!instance)
-      return write(find, find().type === "date" ? wanted : vnDate(wanted), {
-        guard,
-        signal,
-        column: "date"
-      });
+      return write(
+        find,
+        !wanted ? "" : find().type === "date" ? wanted : vnDate(wanted),
+        {
+          guard,
+          signal,
+          column: "date"
+        }
+      );
     if (instance.option("readOnly") || instance.option("disabled"))
       fail("WIDGET", "Ngày khám bị khóa.");
     const [y, m, d] = wanted.split("-").map(Number);
     const w = find().ownerDocument.defaultView;
-    instance.option("value", new w.Date(y, m - 1, d));
+    instance.option("value", wanted ? new w.Date(y, m - 1, d) : null);
     await wait(
       () => {
         guard();
         const value = getInstance(find())?.option("value");
+        if (!wanted) return value == null || value === "";
         if (value && typeof value.getFullYear === "function")
           return [
             value.getFullYear(),
@@ -2619,6 +2659,102 @@
       "EXISTING_DATA",
       "Nội dung đã có khác đề xuất. Chọn Bổ sung/Thay thế có chủ đích hoặc giữ nguyên và xử lý tay."
     );
+  }
+
+  // src/filters.js
+  var controls = (root) => all(
+    root,
+    'input:not([type="hidden"]):not([type="file"]):not([type="password"])'
+  ).filter(
+    (el) => ["text", "search", "date", "number"].includes(el.type) && !el.closest('.dx-datagrid,[role="grid"]') && !el.closest("table")?.querySelector("thead")
+  );
+  function captureFilters(root) {
+    const inputs = controls(root);
+    return inputs.flatMap((el) => {
+      let label = all(root, "label").find((l) => l.htmlFor && l.htmlFor === el.id)?.textContent?.trim();
+      if (!label) {
+        for (let p = el.parentElement, depth = 0; p && root.contains(p) && depth < 4; p = p.parentElement, depth++) {
+          if (inputs.filter((i) => p.contains(i)).length !== 1) break;
+          const labels = all(p, "label,.control-label,.dx-field-item-label-text");
+          if (labels.length === 1) {
+            label = labels[0].textContent.trim();
+            break;
+          }
+        }
+      }
+      const key = aliasKey(
+        label || el.getAttribute("aria-label") || el.name || ""
+      );
+      const locator = label ? { names: [label] } : el.name ? { name: el.name } : el.getAttribute("aria-label") ? { names: [el.getAttribute("aria-label")] } : el.id ? { id: el.id } : null;
+      if (!locator) {
+        if (read(el))
+          fail(
+            "UI_CHANGED",
+            "Bộ lọc có giá trị nhưng chưa có nhãn/định danh để khôi phục."
+          );
+        return [];
+      }
+      return [
+        {
+          ...locator,
+          key,
+          value: read(el),
+          isDate: el.type === "date" || !!el.closest(".dx-datebox,dx-date-box") || /ngày|ngay/i.test(label || el.name || el.id)
+        }
+      ];
+    });
+  }
+  async function restoreFilters(adapter, filters) {
+    let changed = false;
+    const guard = () => {
+      if (adapter.context(false).page !== "list")
+        fail("CONTEXT", "Đã rời danh sách.");
+    };
+    for (const f of filters || []) {
+      const find = () => {
+        const root = adapter.context(false).root;
+        if (f.names || !f.id && !f.name && f.key)
+          return field(root, f.names || ALIASES[f.key], { forRead: true });
+        return unique(
+          controls(root).filter(
+            (el) => f.name ? el.name === f.name : el.id === f.id
+          ),
+          "Bộ lọc danh sách"
+        );
+      };
+      if (read(find()) === f.value) continue;
+      changed = true;
+      await (f.isDate ? writeDate : write)(find, f.value, {
+        guard,
+        signal: adapter.signal
+      });
+    }
+    return changed;
+  }
+
+  // src/referral-target.js
+  var REFERRAL_CONTROL = 'textarea,input[type="text"],input:not([type]),.ql-editor[contenteditable="true"]';
+  function referralTarget(root, target = null) {
+    if (!target) return field(root, ALIASES.recommendation);
+    return unique(
+      all(root, REFERRAL_CONTROL).filter(
+        (el) => writable(el) && (target.name ? el.name === target.name : target.id ? el.id === target.id : el.closest(".dx-htmleditor[id]")?.id === target.hostId)
+      ),
+      "Ô đề nghị do người dùng chọn"
+    );
+  }
+  function describeReferralTarget(root, el) {
+    if (!root.contains(el) || !el.matches(REFERRAL_CONTROL) || !writable(el))
+      fail("UI_CHANGED", "Chọn bên trong ô Đề nghị có thể nhập trên phiếu.");
+    const target = el.name ? { name: el.name } : el.id ? { id: el.id } : el.closest(".dx-htmleditor[id]")?.id ? { hostId: el.closest(".dx-htmleditor[id]").id } : null;
+    if (!target)
+      fail(
+        "UI_CHANGED",
+        "Ô đã chọn chưa có định danh ổn định; dùng Sao chép để dán vào Đề nghị."
+      );
+    if (referralTarget(root, target) !== el)
+      fail("UI_CHANGED", "Không xác định duy nhất ô đã chọn.");
+    return target;
   }
 
   // src/adapters.js
@@ -2785,7 +2921,7 @@
           );
         } else
           await write(
-            () => field(this.planRoot(page), f.names),
+            () => this.planField(page, f),
             f.value,
             this.options(page, f.key)
           );
@@ -2800,10 +2936,14 @@
         if (f.choice) {
           if (!selected(choice(c.root, f.value)))
             fail("VERIFY", "Trạng thái đề nghị/Nitrit chưa khớp.");
-        } else if (!equivalent(read(field(c.root, f.names)), f.value, f.key))
+        } else if (!equivalent(read(this.planField(page, f)), f.value, f.key))
           fail("VERIFY", "Đọc lại dữ liệu chưa khớp.");
       }
       return true;
+    }
+    planField(page, f) {
+      const root = this.planRoot(page);
+      return f.target ? referralTarget(root, f.target) : field(root, f.names);
     }
     async prepareConclusion({
       values = null,
@@ -2851,6 +2991,23 @@
       }
       return { kind: "conclusion", fields, proposal: p };
     }
+    async prepareReferral(referral, mode = "keep") {
+      const c = this.guard("conclusion");
+      if (!referral?.case || !sameCase(referral.case, c.case))
+        fail("IDENTITY", "Đề nghị thuộc hồ sơ khác; mở lại trình soạn.");
+      const el = referralTarget(c.root, referral.target);
+      return {
+        kind: "conclusion",
+        fields: [
+          {
+            key: "recommendation",
+            names: ALIASES.recommendation,
+            target: referral.target || null,
+            value: combineExisting(read(el), referral.text, mode)
+          }
+        ]
+      };
+    }
     saveButton() {
       const c = this.guard();
       return button(c.root, "Lưu thay đổi");
@@ -2868,30 +3025,27 @@
     }
     filters() {
       const c = this.context(false);
-      const keys = ["cccd", "name", "date"];
-      return keys.flatMap((k) => {
-        const input = field(c.root, ALIASES[k], { optional: true });
-        return input ? [{ key: k, value: read(input) }] : [];
-      });
+      return captureFilters(c.root);
     }
     async restoreFilters(filters) {
-      for (const f of filters || []) {
-        const c = this.context(false);
-        const input = field(c.root, ALIASES[f.key], { optional: true });
-        if (!input) fail("UI_CHANGED", "Không khôi phục được bộ lọc danh sách.");
-        if (read(input) !== f.value)
-          await write(
-            () => field(this.context(false).root, ALIASES[f.key]),
-            f.value,
-            {
-              guard: () => {
-                if (this.context(false).page !== "list")
-                  fail("CONTEXT", "Đã rời danh sách.");
-              },
-              signal: this.signal
-            }
-          );
-      }
+      return restoreFilters(this, filters);
+    }
+    async refreshList() {
+      const before = this.signature();
+      const previousRows = listRows(this.context(false)).map((r) => r.row);
+      button(this.context(false).root, "Xem").click();
+      return wait(
+        () => {
+          const c = this.context(false);
+          const rows = listRows(c);
+          return this.signature() !== before || rows.some((r) => !previousRows.includes(r.row));
+        },
+        {
+          signal: this.signal,
+          timeout: 3e4,
+          label: "báo cáo tải mới theo bộ lọc đã khôi phục"
+        }
+      );
     }
     async search(item, examDate) {
       const c = this.context(false);
@@ -3371,11 +3525,9 @@
 
   // src/runner.js
   var TASKS = {
-    fill: "Điền hồ sơ hiện tại — không lưu",
-    cls: "Điền CLS hồ sơ hiện tại — không lưu",
+    auto: "AUTO mục đang mở",
     batchCls: "Hàng loạt CLS M3/M4 + Kết luận",
-    batchConclusion: "Hàng loạt chỉ Kết luận M2/M11",
-    proposal: "Soạn và điền đề nghị — không lưu"
+    batchConclusion: "Hàng loạt chỉ Kết luận M2/M11"
   };
   var Runner = class {
     constructor({
@@ -3443,7 +3595,13 @@
       });
       this.emit();
     }
-    async start({ task, queue = [], examDate = "", overwrite = "keep" } = {}) {
+    async start({
+      task = "auto",
+      queue = [],
+      examDate = "",
+      overwrite = "keep",
+      referral = null
+    } = {}) {
       if (this.running) fail("RUNNING", "Một runner đang hoạt động.");
       const old = this.cp();
       if (old?.saveSent && !old?.saveVerified)
@@ -3455,7 +3613,16 @@
         session: this.store.data.context,
         requireIdentity: !task?.startsWith("batch")
       });
-      if (!TASKS[task]) fail("TASK", "Tác vụ không hợp lệ.");
+      if (task === "auto") task = operationFor(ctx);
+      if (!TASKS[task] && !["fill", "cls", "proposal"].includes(task))
+        fail("TASK", "Tác vụ không hợp lệ.");
+      if (!task.startsWith("batch") && operationFor(ctx) !== task)
+        fail("CONTEXT", "Tác vụ không khớp mục đang mở.");
+      if (task === "proposal" && (!referral?.text?.trim() || !sameCase(referral.case, ctx.case)))
+        fail(
+          "CONTEXT",
+          "Mở trình soạn đề nghị của đúng hồ sơ rồi bấm Điền vào đề nghị."
+        );
       const batch = task.startsWith("batch");
       if (batch) {
         if (ctx.page !== "list")
@@ -3472,11 +3639,8 @@
         const supported = task === "batchCls" ? ["M3", "M4"] : ["M2", "M11"];
         if (queue.some((i) => i.model && !supported.includes(i.model)))
           fail("CONTEXT", "Excel chứa mẫu ngoài nhóm tác vụ đã chọn.");
-        if (!examDate && !(queue.length && queue.every((i) => i.date)) && !readExamFilter(ctx))
-          fail("DATE", "Cần nhập ngày khám một lần trước khi chạy.");
       }
       if (examDate) examDate = date(examDate);
-      else if (batch && readExamFilter(ctx)) examDate = date(readExamFilter(ctx));
       const now = (/* @__PURE__ */ new Date()).toISOString();
       const adapter = this.adapterFactory({
         win: this.win,
@@ -3500,6 +3664,9 @@
         queueIndex: 0,
         examDate,
         overwrite,
+        referral,
+        // TD keeps the CLS report while moving between tabs of the same visit.
+        lab: ctx.case && old?.lab && sameCase(ctx.case, old.case) ? old.lab : null,
         step: batch ? "LIST" : task === "fill" ? "FILL_CURRENT" : task === "cls" ? "PREPARE_LAB" : "PREPARE_CONCLUSION",
         active: true,
         auto: false,
@@ -3647,10 +3814,10 @@
           const result = await fillCurrent(adapter, { mode: cp.overwrite });
           this.log(
             "FILLED_NOT_SAVED",
-            "Chỉ điền hồ sơ hiện tại; người dùng kiểm tra và tự lưu.",
+            "AUTO đã điền xong. Kiểm tra và bấm Lưu thay đổi trên Medinet.",
             result
           );
-          this.update({ active: false });
+          this.update({ active: false, step: "COMPLETE" });
           return true;
         }
         case "LIST": {
@@ -3672,7 +3839,8 @@
             ),
             { signal, onAttempt: (attempt) => this.update({ attempt }) }
           );
-          await adapter.restoreFilters(cp.filters);
+          const filtersChanged = await adapter.restoreFilters(cp.filters);
+          if (filtersChanged && !cp.queue.length) await adapter.refreshList();
           await this.transition("SELECT", { case: null });
           return false;
         }
@@ -3733,7 +3901,7 @@
             candidates = listRows(adapter.context(false)).map((r) => {
               if (r.error) throw r.error;
               return r.case;
-            });
+            }).filter((c) => !cp.examDate || c.date === cp.examDate);
           this.update({
             planned: [
               .../* @__PURE__ */ new Set([...cp.planned || [], ...candidates.map(caseKey)])
@@ -3760,8 +3928,6 @@
             this.update({ active: false, step: "COMPLETE" });
             return true;
           }
-          if (cp.examDate && next.date !== cp.examDate && !cp.queue.length)
-            fail("DATE", "Ngày khám trong danh sách khác ngày đã xác nhận.");
           await this.transition("OPEN", {
             case: next,
             verified: {},
@@ -3794,14 +3960,9 @@
           return false;
         }
         case "PREPARE_CONCLUSION": {
-          let lab = cp.lab;
-          if (cp.task === "proposal" && !lab) {
-            lab = await this.labs.match(adapter.context().case, { signal });
-            this.update({ lab });
-          }
-          const plan = await adapter.prepareConclusion({
-            values: lab?.values || null,
-            noLab: lab?.status === "NO_LAB",
+          const plan = cp.task === "proposal" ? await adapter.prepareReferral(cp.referral, cp.overwrite) : await adapter.prepareConclusion({
+            values: cp.lab?.values || null,
+            noLab: cp.lab?.status === "NO_LAB",
             mode: cp.overwrite
           });
           await this.transition("FILL_PLAN", { plan });
@@ -3812,10 +3973,10 @@
           if (!cp.task.startsWith("batch")) {
             this.log(
               "FILLED_NOT_SAVED",
-              "Đã điền và đọc lại ô; chưa lưu lên máy chủ.",
+              "Đã điền xong. Kiểm tra và bấm Lưu thay đổi trên Medinet.",
               { fields: cp.plan.fields.length }
             );
-            this.update({ active: false });
+            this.update({ active: false, step: "COMPLETE" });
             return true;
           }
           await this.transition("SAVE");
@@ -3985,14 +4146,6 @@
       }
     }
   };
-  function readExamFilter(ctx) {
-    try {
-      const raw = readLabel(ctx.root, "date");
-      return raw ? date(raw) : null;
-    } catch {
-      return null;
-    }
-  }
 
   // src/network.js
   function bodyIdentity(body, c) {
@@ -4183,6 +4336,10 @@
   };
 
   // src/ui.js
+  var escape = (s) => String(s ?? "").replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
   function download(blob, name, doc = document) {
     const url = URL.createObjectURL(blob), a = doc.createElement("a");
     a.href = url;
@@ -4198,25 +4355,87 @@
       this.queue = [];
       this.invalid = [];
       this.busy = false;
+      this.referralDrafts = /* @__PURE__ */ new Map();
       this.host = win.document.createElement("div");
       this.host.id = "tro-ly-medinet";
       win.document.body.append(this.host);
       this.root = this.host.attachShadow({ mode: "open" });
-      this.root.innerHTML = `<style>:host{all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483000;font:13px/1.45 system-ui;color:#172b3a}details{width:min(350px,calc(100vw - 24px));background:white;border:1px solid #64748b;border-radius:8px;box-shadow:0 3px 12px #0002}summary{padding:9px;cursor:pointer;background:#e0f2fe;border-radius:8px;font-weight:650}.body{padding:10px;max-height:65vh;overflow:auto}label{display:block;margin:8px 0 3px}select,input,textarea{box-sizing:border-box;width:100%;padding:5px;font:inherit}button{font:inherit;padding:5px 8px;margin:4px 3px 4px 0;cursor:pointer}button:disabled{cursor:default}p{margin:6px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow:auto}#message{border-left:3px solid #0369a1;padding-left:8px}small{display:block;color:#475569}table{border-collapse:collapse}td{border:1px solid #ccd;padding:4px}</style><details><summary>Trợ lý Medinet · <span id="state">Sẵn sàng kiểm tra</span></summary><div class="body"><p id="context"></p><label>Tác vụ<select id="task">${Object.entries(
-        TASKS
-      ).map(([k, v]) => `<option value="${k}">${v}</option>`).join(
-        ""
-      )}</select></label><p id="reason"></p><label>Ngày khám (ngày/tháng/năm)<input id="date" placeholder="dd/mm/yyyy"></label><label>Khi có nội dung khác<select id="mode"><option value="keep">Giữ nguyên — dừng để kiểm tra nếu khác</option><option value="append">Bổ sung đề nghị (CLS vẫn giữ nguyên)</option><option value="replace">Thay thế có chủ đích</option></select></label><label>Ngày trong nguồn CLS<select id="order"><option value="AUTO">Tự kiểm tra — dừng nếu ngày mơ hồ</option><option value="DMY">Nguồn xác nhận dd/mm/yyyy</option><option value="MDY">Nguồn xác nhận mm/dd/yyyy</option></select></label><label>Nhập Excel (.xlsx, mọi sheet)<input id="file" type="file" accept=".xlsx"></label><label>Hoặc danh sách CCCD (mỗi dòng một số)<textarea id="cccd" rows="2"></textarea></label><button id="import">Nạp danh sách</button><button id="clear">Bỏ danh sách</button><p id="summary"></p><button id="start">Bắt đầu</button><button id="pause">Tạm dừng</button><button id="resume">Tiếp tục</button><button id="stop">Dừng</button><button id="skip">Bỏ ca để kiểm tra</button><p id="progress"></p><p id="source"></p><button id="refresh">Làm mới CLS</button><button id="warnings">Xem cảnh báo CLS</button><button id="logs">Xem nhật ký</button><button id="export">Xuất Excel</button><button id="unresolved">Xuất ca chưa hoàn tất</button><button id="diagnostic">Xuất chẩn đoán đã che định danh</button><button id="erase">Xóa dữ liệu phiên trong tab</button><p id="message" role="status"></p><pre id="viewer"></pre><small>Tắt cả 4 script cũ trước khi dùng. Điền hồ sơ/CLS/đề nghị hiện tại không tự lưu. Nhật ký có dữ liệu cá nhân, chỉ lưu/chia sẻ đúng nơi được phép.</small></div></details>`;
+      this.root.innerHTML = `<style>
+:host{all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483000;font:13px/1.45 system-ui;color:#172b3a}
+details.panel{width:min(350px,calc(100vw - 24px));background:white;border:1px solid #64748b;border-radius:8px;box-shadow:0 3px 12px #0002}
+summary{padding:9px;cursor:pointer;background:#e0f2fe;border-radius:8px;font-weight:650}.body{padding:10px;max-height:65vh;overflow:auto}
+label{display:block;margin:8px 0 3px}select,input,textarea{box-sizing:border-box;width:100%;padding:5px;font:inherit}
+button{font:inherit;padding:5px 8px;margin:4px 3px 4px 0;cursor:pointer}button:disabled{cursor:default}p{margin:6px 0}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow:auto}#message{border-left:3px solid #0369a1;padding-left:8px}small{display:block;color:#475569}
+[hidden]{display:none!important}#departments{display:grid;grid-template-columns:1fr 1fr}#departments button[aria-pressed=true]{background:#dbeafe;border:1px solid #2563eb}
+h4{margin:8px 0}#referral-preview{min-height:100px}#referral-observation{min-height:65px}
+</style><details class="panel"><summary>Trợ lý Medinet · <span id="state">Sẵn sàng kiểm tra</span></summary><div class="body">
+<p id="context"></p><label id="task-control" hidden>Tác vụ<select id="task"></select></label><p id="reason"></p>
+<section id="batch-controls" hidden>
+<p>Giữ khoảng ngày và bộ lọc đã chọn trên danh sách Medinet.</p>
+<label>Nhập Excel (.xlsx, mọi sheet)<input id="file" type="file" accept=".xlsx"></label>
+<label>Hoặc danh sách CCCD (mỗi dòng một số)<textarea id="cccd" rows="2"></textarea></label>
+<button id="import">Nạp danh sách</button><button id="clear">Bỏ danh sách</button><p id="summary"></p>
+</section>
+<button id="start">AUTO</button><button id="pause">Tạm dừng</button><button id="resume">Tiếp tục</button><button id="stop">Dừng</button><button id="skip">Bỏ ca để kiểm tra</button>
+<section id="referral" hidden><h4>Đề nghị khám</h4><p id="referral-review"></p>
+<label>Nội dung ghi nhận<textarea id="referral-observation"></textarea></label><p>Khoa khám</p><div id="departments">${REFERRAL_DEPARTMENTS.map((name, i) => `<button type="button" data-department="${i}" aria-pressed="false">${escape(name)}</button>`).join("")}</div>
+<label>Lời đề nghị<textarea id="referral-preview" readonly></textarea></label>
+<button id="referral-fill">Điền vào đề nghị</button><button id="referral-copy">Sao chép</button><button id="referral-target">Chọn ô trên phiếu</button><button id="referral-clear">Bỏ chọn khoa</button></section>
+<p id="progress"></p><div id="cls-controls" hidden><p id="source"></p><button id="refresh">Làm mới CLS</button><button id="warnings">Xem cảnh báo CLS</button></div>
+<details><summary>Tùy chọn</summary>
+<label>Khi có nội dung khác<select id="mode"><option value="keep">Giữ nguyên — dừng để kiểm tra nếu khác</option><option value="append">Bổ sung đề nghị (CLS vẫn giữ nguyên)</option><option value="replace">Thay thế có chủ đích</option></select></label>
+<label id="order-control">Ngày trong nguồn CLS<select id="order"><option value="AUTO">Tự kiểm tra — dừng nếu ngày mơ hồ</option><option value="DMY">Nguồn xác nhận dd/mm/yyyy</option><option value="MDY">Nguồn xác nhận mm/dd/yyyy</option></select></label>
+<button id="erase">Xóa dữ liệu phiên trong tab</button><button id="diagnostic">Xuất chẩn đoán đã che định danh</button></details>
+<button id="logs">Xem nhật ký</button><button id="export">Xuất Excel</button><button id="unresolved">Xuất ca chưa hoàn tất</button>
+<p id="message" role="status"></p><pre id="viewer"></pre><small id="usage"></small>
+</div></details>`;
       const click = (id, fn) => this.el(id).addEventListener("click", () => this.action(fn));
-      click(
-        "start",
-        () => runner.start({
-          task: this.el("task").value,
-          queue: this.queue,
-          examDate: this.el("date").value,
-          overwrite: this.el("mode").value
-        })
+      click("start", () => this.start());
+      click("referral-fill", () => {
+        const current = this.referralContext();
+        return runner.start({
+          task: "auto",
+          overwrite: this.el("mode").value,
+          referral: {
+            case: current.case,
+            text: this.el("referral-preview").value,
+            target: this.pickedReferralTarget || null
+          }
+        });
+      });
+      click("referral-copy", async () => {
+        this.referralContext();
+        const preview = this.el("referral-preview");
+        try {
+          await win.navigator.clipboard.writeText(preview.value);
+          this.message("Đã sao chép lời đề nghị.");
+        } catch {
+          preview.focus();
+          preview.select();
+          this.message("Nhấn Ctrl+C để sao chép lời đề nghị đã chọn.");
+        }
+      });
+      click("referral-target", () => this.pickReferralTarget());
+      click("referral-clear", () => {
+        this.departments.clear();
+        this.refreshReferral();
+      });
+      this.el("referral-observation").addEventListener(
+        "input",
+        () => this.action(() => this.refreshReferral())
       );
+      for (const button2 of this.el("departments").querySelectorAll("button"))
+        button2.addEventListener(
+          "click",
+          () => this.action(() => {
+            this.referralContext();
+            const name = REFERRAL_DEPARTMENTS[Number(button2.dataset.department)];
+            if (this.departments.has(name)) this.departments.delete(name);
+            else this.departments.add(name);
+            this.refreshReferral();
+          })
+        );
       click("pause", () => runner.pause());
       click("stop", () => runner.stop());
       click("resume", () => runner.resume());
@@ -4245,7 +4464,7 @@
           this.invalid = r.invalid;
           this.showSummary();
           this.message(
-            "Đã đọc Excel. Kiểm tra tóm tắt và ngày khám trước khi Bắt đầu."
+            "Đã đọc Excel. Kiểm tra tóm tắt rồi bấm Bắt đầu; giữ khoảng ngày đã chọn trên Medinet."
           );
           this.el("file").value = "";
         })
@@ -4344,6 +4563,8 @@ ${x.note || x.groupReason || ""}`
             "Cần đối chiếu lần lưu trước khi xóa checkpoint."
           );
         await labs.clearCache();
+        this.referralDrafts.clear();
+        this.closeReferral();
         runner.store.data = { schema: 1, checkpoint: null, logs: [] };
         runner.store.save();
         this.queue = [];
@@ -4355,8 +4576,145 @@ ${x.note || x.groupReason || ""}`
       });
       this.installDrag();
       const persisted = runner.cp();
+      if (persisted?.task?.startsWith("batch"))
+        this.queue = persisted.queue || [];
+      this.showSummary();
       if (persisted?.sourceOrder) this.el("order").value = persisted.sourceOrder;
       this.refresh();
+    }
+    context(requireIdentity = true) {
+      const cp = this.runner.cp();
+      return resolve(this.win.document, this.win.location.href, {
+        session: cp?.case ? cp : this.runner.store.data.context,
+        requireIdentity
+      });
+    }
+    start() {
+      const current = this.context();
+      const action = actionsFor(current).find(
+        (a) => a.value === this.el("task").value
+      );
+      if (!action)
+        throw new Fault(
+          "CONTEXT",
+          "Mục đang mở đã thay đổi; kiểm tra lại trước khi chạy."
+        );
+      if (current.page === "conclusion") return this.openReferral(current);
+      return this.runner.start({
+        task: action.value,
+        queue: current.page === "list" ? this.queue : [],
+        overwrite: this.el("mode").value
+      });
+    }
+    openReferral(current) {
+      if (this.runner.running)
+        throw new Fault("RUNNING", "Chờ tác vụ đang chạy hoàn tất.");
+      this.cancelReferralPick?.();
+      this.pickedReferralTarget = null;
+      const cp = this.runner.cp();
+      const lab = cp?.lab && sameCase(cp.case, current.case) ? cp.lab : null;
+      const findings = lab?.status === "OK" ? findingsFor(lab.values, current.model) : [];
+      const diseases = readLabel(current.root, "disease");
+      if (diseases === null)
+        throw new Fault("DATA_REVIEW", "Chưa đọc được mục bệnh/tật của hồ sơ.");
+      const routing = analyzeReferralDepartments(
+        diseases,
+        findings.map((f) => ({ ...f, key: f.column }))
+      );
+      const initial = buildCombinedReferralObservation(diseases, findings);
+      this.referralSourceKey = JSON.stringify([
+        diseases,
+        initial,
+        routing.departments
+      ]);
+      const saved = this.referralDrafts.get(caseKey(current.case));
+      const draft = saved?.sourceKey === this.referralSourceKey ? saved : {
+        observation: initial,
+        departments: routing.departments
+      };
+      this.referralCase = { ...current.case };
+      this.departments = new Set(draft.departments);
+      this.el("referral-observation").value = draft.observation;
+      this.el("referral-review").textContent = [
+        routing.unknown.length ? `Chưa gợi ý khoa cho: ${routing.unknown.join("; ")}` : "",
+        findings.some((f) => f.level === "urgent") ? "Có kết quả cần được đánh giá ngay." : "",
+        !lab ? "Chưa có báo cáo CLS của lượt này; hiện gợi ý theo bệnh/tật đã ghi." : ""
+      ].filter(Boolean).join("\n");
+      this.el("referral").hidden = false;
+      this.refreshReferral();
+    }
+    referralContext() {
+      const current = this.context();
+      if (current.page !== "conclusion" || !sameCase(current.case, this.referralCase))
+        throw new Fault(
+          "IDENTITY",
+          "Hồ sơ hoặc tab đã đổi; mở lại trình soạn đề nghị."
+        );
+      return current;
+    }
+    refreshReferral() {
+      this.referralContext();
+      this.referralDrafts.set(caseKey(this.referralCase), {
+        sourceKey: this.referralSourceKey,
+        observation: this.el("referral-observation").value,
+        departments: [...this.departments]
+      });
+      if (this.referralDrafts.size > 20)
+        this.referralDrafts.delete(this.referralDrafts.keys().next().value);
+      this.el("referral-preview").value = buildReferralProposal(
+        this.el("referral-observation").value,
+        [...this.departments]
+      );
+      for (const button2 of this.el("departments").querySelectorAll("button"))
+        button2.setAttribute(
+          "aria-pressed",
+          String(
+            this.departments.has(
+              REFERRAL_DEPARTMENTS[Number(button2.dataset.department)]
+            )
+          )
+        );
+      this.el("referral-fill").disabled = !this.el("referral-preview").value || this.runner.running;
+      this.el("referral-copy").disabled = !this.el("referral-preview").value;
+    }
+    closeReferral() {
+      this.cancelReferralPick?.();
+      this.pickedReferralTarget = null;
+      this.referralCase = null;
+      this.departments = /* @__PURE__ */ new Set();
+      this.el("referral").hidden = true;
+      this.el("referral-observation").value = "";
+      this.el("referral-preview").value = "";
+      this.el("referral-review").textContent = "";
+    }
+    pickReferralTarget() {
+      this.referralContext();
+      this.cancelReferralPick?.();
+      this.message("Bấm bên trong ô Đề nghị (ghi rõ) trên phiếu Medinet.");
+      const cancel = () => {
+        this.win.document.removeEventListener("click", pick, true);
+        clearTimeout(timer);
+        this.cancelReferralPick = null;
+      };
+      const pick = (event) => {
+        if (event.target.closest("#tro-ly-medinet")) return;
+        try {
+          const current = this.referralContext();
+          const target = event.target.closest(REFERRAL_CONTROL);
+          if (!target) return;
+          this.pickedReferralTarget = describeReferralTarget(
+            current.root,
+            target
+          );
+          this.message("Đã chọn ô. Bấm Điền vào đề nghị để nhập nội dung.");
+        } catch (error) {
+          this.message(error.message);
+        }
+        cancel();
+      };
+      const timer = setTimeout(cancel, 15e3);
+      this.cancelReferralPick = cancel;
+      this.win.document.addEventListener("click", pick, true);
     }
     installDrag() {
       const title = this.root.querySelector("summary");
@@ -4403,6 +4761,7 @@ ${x.note || x.groupReason || ""}`
     }
     dispose() {
       this.dragCleanup?.();
+      this.cancelReferralPick?.();
     }
     el(id) {
       return this.root.getElementById(id);
@@ -4420,7 +4779,7 @@ ${x.note || x.groupReason || ""}`
     }
     showSummary() {
       const s = summarize(this.queue, this.invalid);
-      this.el("summary").textContent = `${s.rows} dòng hợp lệ · ${s.people} người · ${s.visits} lượt đã có mã phiếu/ngày (lượt còn lại sẽ xác minh từ danh sách) · ${s.invalid} dòng cần kiểm tra. Mẫu: ${s.models.join(", ")}. ${s.from ? vnDate(s.from) + "–" + vnDate(s.to) : "Chưa có ngày; dùng ngày xác nhận ở trên"}. Sẽ xử lý toàn bộ dòng hợp lệ; trạng thái từ Excel chỉ để tham khảo.`;
+      this.el("summary").textContent = `${s.rows} dòng hợp lệ · ${s.people} người · ${s.visits} lượt đã có mã phiếu/ngày (lượt còn lại sẽ xác minh từ danh sách) · ${s.invalid} dòng cần kiểm tra. Mẫu: ${s.models.join(", ")}. ${s.from ? vnDate(s.from) + "–" + vnDate(s.to) : "Dùng khoảng ngày đã chọn trên Medinet"}. Sẽ xử lý toàn bộ dòng hợp lệ; trạng thái từ Excel chỉ để tham khảo.`;
       if (this.invalid.length)
         this.el("viewer").textContent = this.invalid.map((i) => `${i.source.sheet || ""}:${i.source.row || ""} ${i.reason}`).join("\n");
     }
@@ -4436,25 +4795,36 @@ ${x.note || x.groupReason || ""}`
         reason = e.message;
       }
       this.el("context").textContent = c ? `Mẫu ${c.model} · Trang ${c.page}` : "Chưa xác định ngữ cảnh";
-      const task = this.el("task").value;
-      for (const option of this.el("task").options) {
-        let allowed = false;
-        if (c) {
-          if (option.value === "fill")
-            allowed = ["M2", "M3", "M4", "M5", "M6"].includes(c.model) && ["history", "mental", "questions", "clinical"].includes(c.page);
-          if (option.value === "cls")
-            allowed = ["M3", "M4"].includes(c.model) && c.page !== "list";
-          if (option.value === "proposal") allowed = c.page === "conclusion";
-          if (option.value === "batchCls")
-            allowed = ["M3", "M4"].includes(c.model) && c.page === "list";
-          if (option.value === "batchConclusion")
-            allowed = ["M2", "M11"].includes(c.model) && c.page === "list";
+      const actions = actionsFor(c), oldTask = this.el("task").value;
+      this.el("task").replaceChildren(
+        ...actions.map((a) => {
+          const option = this.win.document.createElement("option");
+          option.value = a.value;
+          option.textContent = a.label;
+          return option;
+        })
+      );
+      if (actions.some((a) => a.value === oldTask))
+        this.el("task").value = oldTask;
+      this.el("task-control").hidden = actions.length < 2;
+      const action = actions.find((a) => a.value === this.el("task").value);
+      const batch = c?.page === "list" && !!action;
+      this.el("batch-controls").hidden = !batch;
+      this.el("start").textContent = action?.label || "AUTO";
+      this.el("reason").textContent = reason || (!action ? "Mở hồ sơ hoặc danh sách được hỗ trợ để dùng AUTO." : batch ? this.queue.length ? `Chạy ${this.queue.length} dòng đã nạp trong khoảng ngày trên Medinet.` : "Chạy các lượt trong danh sách Medinet đã lọc." : c.page === "conclusion" ? "Bấm Soạn đề nghị khám để xem, chọn khoa và điền nội dung." : "Bấm AUTO để xử lý mục đang mở như Auto KSK TD.");
+      this.el("start").disabled = this.runner.running || !action;
+      this.el("usage").textContent = batch ? "Tắt cả 4 script cũ. Luồng hàng loạt điền, lưu và đối chiếu từng lượt." : "Tắt cả 4 script cũ. AUTO điền mục đang mở; kiểm tra rồi bấm Lưu thay đổi trên Medinet như script TD gốc.";
+      const hasCls = ["M3", "M4"].includes(c?.model);
+      this.el("cls-controls").hidden = !hasCls;
+      this.el("order-control").hidden = !hasCls;
+      if (this.referralCase && !this.el("referral").hidden) {
+        try {
+          this.referralContext();
+        } catch {
+          this.closeReferral();
         }
-        option.disabled = !allowed;
       }
-      const opt = [...this.el("task").options].find((o) => o.value === task);
-      this.el("reason").textContent = reason || (!opt || opt.disabled ? "Tác vụ chưa phù hợp trang hiện tại. Chọn tác vụ đang được bật." : "Kiểm tra nguồn/ngày rồi bấm Bắt đầu.");
-      this.el("start").disabled = this.runner.running || !c || opt?.disabled;
+      this.el("skip").hidden = !cp?.task?.startsWith("batch");
       this.el("pause").disabled = !this.runner.running;
       this.el("stop").disabled = !cp?.active;
       this.el("skip").disabled = this.runner.running || !cp?.case || !!(cp.saveSent && !cp.saveVerified);
