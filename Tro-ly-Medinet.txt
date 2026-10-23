@@ -1,0 +1,4587 @@
+// ==UserScript==
+// @name         Trợ lý Medinet
+// @namespace    VietsDragon/AutoFixMediNet
+// @version      1.0.0
+// @description  Tích hợp điền hồ sơ, CLS và kết luận; xác minh đúng lượt, checkpoint và đọc lại sau lưu.
+// @author       Trần Xuân Cường; tích hợp theo yêu cầu người dùng
+// @match        https://quanlyskcd.medinet.org.vn/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+  // src/core.js
+  var Fault = class extends Error {
+    constructor(code, message, detail = {}) {
+      super(message);
+      this.code = code;
+      this.detail = detail;
+    }
+  };
+  var fail = (code, message, detail) => {
+    throw new Fault(code, message, detail);
+  };
+  var norm = (v) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[đĐ]/g, "d").toLowerCase().replace(/\s+/g, " ").trim();
+  var present = (v) => v !== void 0 && v !== null && String(v).trim() !== "";
+  var uid = () => globalThis.crypto.randomUUID();
+  function check(signal) {
+    if (signal?.aborted) throw signal.reason || new Fault("STOPPED", "Đã dừng.");
+  }
+  function delay(ms, signal) {
+    check(signal);
+    return new Promise((resolve2, reject) => {
+      let timer;
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        resolve2();
+      };
+      const abort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        reject(signal.reason || new Fault("STOPPED", "Đã dừng."));
+      };
+      timer = setTimeout(done, ms);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+  async function wait(fn, { timeout = 2e4, interval = 100, signal, label = "giao diện" } = {}) {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+      check(signal);
+      const value = await fn();
+      if (value) return value;
+      await delay(Math.min(interval, end - Date.now()), signal);
+    }
+    fail("TIMEOUT", "Hết thời gian chờ " + label);
+  }
+  async function retryRead(fn, { attempts = 3, signal, onAttempt = () => {
+  } } = {}) {
+    for (let n = 1; n <= attempts; n++) {
+      check(signal);
+      onAttempt(n);
+      try {
+        return await fn();
+      } catch (e) {
+        if (!["TIMEOUT", "NETWORK"].includes(e.code) || n === attempts) throw e;
+        await delay(250 * 2 ** (n - 1), signal);
+      }
+    }
+  }
+  function date(raw, { order = "DMY", excel = false } = {}) {
+    if (!present(raw)) fail("DATE", "Thiếu ngày.");
+    let y, m, d;
+    if (excel && typeof raw === "number") {
+      if (!Number.isInteger(raw) || raw < 1 || raw === 60)
+        fail("DATE", "Excel serial không hợp lệ.");
+      const t2 = new Date(
+        Date.UTC(1899, 11, 31) + (raw - (raw > 60 ? 1 : 0)) * 864e5
+      );
+      [y, m, d] = [t2.getUTCFullYear(), t2.getUTCMonth() + 1, t2.getUTCDate()];
+    } else {
+      const s = String(raw).trim();
+      let x = s.match(
+        /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:T00:00:00(?:\.000)?Z?)?$/
+      );
+      if (x) [y, m, d] = x.slice(1).map(Number);
+      else {
+        x = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
+        if (!x) fail("DATE", "Ngày phải là dd/mm/yyyy hoặc yyyy-mm-dd.");
+        const [a, b, c] = x.slice(1).map(Number);
+        if (order === "AUTO") {
+          if (a <= 12 && b <= 12 && a !== b)
+            fail("DATE_AMBIGUOUS", "Ngày mơ hồ; chọn DMY/MDY một lần cho nguồn.");
+          if (a > 12 && b > 12) fail("DATE", "Ngày không hợp lệ.");
+          [y, m, d] = [c, a > 12 ? b : a, a > 12 ? a : b];
+        } else [y, m, d] = order === "MDY" ? [c, a, b] : [c, b, a];
+      }
+    }
+    const t = new Date(Date.UTC(y, m - 1, d));
+    if (y < 1900 || y > 2100 || t.getUTCFullYear() !== y || t.getUTCMonth() + 1 !== m || t.getUTCDate() !== d)
+      fail("DATE", "Ngày không hợp lệ.");
+    return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  }
+  var vnDate = (s) => {
+    const [y, m, d] = date(s).split("-");
+    return `${d}/${m}/${y}`;
+  };
+  function cccd(v, { numeric: numeric2 = false } = {}) {
+    const s = String(v ?? "").replace(/\s/g, "");
+    if (numeric2 && (!Number.isSafeInteger(Number(v)) || s.length !== 12))
+      fail(
+        "IDENTITY",
+        "CCCD dạng số bị thiếu chữ số hoặc mất độ chính xác; không tự bù số."
+      );
+    if (!/^\d{12}$/.test(s))
+      fail("IDENTITY", "CCCD phải có đủ 12 chữ số nguyên gốc.");
+    return s;
+  }
+  function caseKey(c) {
+    if (!c.model || !c.visitId || !c.date || !c.cccd)
+      fail("IDENTITY", "Thiếu mẫu, mã phiếu, ngày khám hoặc CCCD.");
+    return [c.model, c.visitId, cccd(c.cccd), date(c.date)].join("|");
+  }
+  function sameCase(a, b) {
+    return caseKey(a) === caseKey(b) && (!a.name || !b.name || norm(a.name) === norm(b.name)) && (!a.dob || !b.dob || date(a.dob) === date(b.dob)) && (!a.sex || !b.sex || norm(a.sex) === norm(b.sex));
+  }
+  var digest = async (value) => Array.from(
+    new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(JSON.stringify(value))
+      )
+    )
+  ).map((x) => x.toString(16).padStart(2, "0")).join("");
+  var technicalReport = (e, context) => ({
+    code: e.code || "TECHNICAL",
+    step: context?.step || "",
+    route: String(context?.url || "").split("?")[0].replace(/[0-9a-f]{8}-[0-9a-f-]+/gi, ":id").replace(/\d+/g, ":n"),
+    widgets: context?.widgets || [],
+    reason: e.code === "TIMEOUT" ? "Điều kiện giao diện chưa đạt trong thời hạn." : e.message.replace(/\b\d{6,}\b/g, "[ẩn]")
+  });
+
+  // src/source-rules.js
+  var CAN_LAM_SANG_FIELD_MAP = [
+    { label: "Số lượng HC", column: "RBC" },
+    { label: "Huyết sắc tố", column: "HGB" },
+    { label: "Hematocrit", column: "HCT" },
+    { label: "MCV", column: "MCV" },
+    { label: "MCH", column: "MCH" },
+    { label: "MCHC", column: "MCHC" },
+    { label: "RDW", column: "RDW" },
+    { label: "Số lượng bạch cầu", column: "WBC" },
+    { label: "Số lượng bạch cầu trung tính", column: "NEU#" },
+    { label: "Số lượng bạch cầu lympho", column: "LYM#" },
+    { label: "Số lượng bạch cầu đơn nhân", column: "MONO#" },
+    { label: "Số lượng bạch cầu ái toan", column: "EOS#" },
+    { label: "Số lượng bạch cầu ái kiềm", column: "BASO#" },
+    { label: "Số lượng tiểu cầu", column: "PLT" },
+    { label: "Đường máu", column: "Glucose" },
+    { label: "Urê", column: "Ure" },
+    { label: "Creatinin", column: "Creatinine" },
+    { label: "ASAT(GOT)", column: "AST" },
+    { label: "ALAT (GPT)", column: "ALT" },
+    { label: "Tỉ trọng", column: "S.G" },
+    { label: "pH", column: "pH" },
+    { label: "Bạch cầu", column: "LEU" },
+    { label: "Hồng cầu", column: "BLD" },
+    { label: "Protein", column: "PRO" },
+    { label: "Glucose", column: "GLU" },
+    { label: "Thể cetonic", column: "KET" },
+    { label: "Bilirubin", column: "BIL" },
+    { label: "Urobilinogen", column: "URO" }
+  ];
+  var QUALITATIVE_URINE_COLUMNS = [
+    "LEU",
+    "BLD",
+    "PRO",
+    "GLU",
+    "KET",
+    "BIL",
+    "URO"
+  ];
+  var M4_HOI_BENH_ANSWER_MAP = {
+    // Chọn "Không"
+    "D1": "không",
+    "D2.1": "không",
+    "D2.2": "không",
+    "D2.3": "không",
+    "D2.4": "không",
+    "D2.5": "không",
+    "D3.1": "không",
+    "D3.2": "không",
+    "D3.3": "không",
+    "D4.1": "không",
+    "D4.2": "không",
+    "D4.3": "không",
+    "D4.4": "không",
+    "D4.5": "không",
+    "D4.6": "không",
+    "D4.7": "không",
+    "D4.8": "không",
+    "D5.1": "không",
+    "D5.2": "không",
+    "D5.3": "không",
+    "D5.4": "không",
+    "D5.5": "không",
+    "D5.6": "không",
+    "D5.7": "không",
+    "D5.8": "không",
+    "D5.9": "không",
+    "D5.10": "không",
+    "D5.11": "không",
+    // D8.3.1 có bộ đáp án riêng: "Không/Một số lần" vs
+    // "Tất cả mọi lúc/ hầu hết thời gian" (không phải
+    // Có/Không thường) -> đáp án mong muốn vẫn là "không",
+    // findAnswerListItem sẽ tự khớp với "không/một số lần"
+    "D8.3.1": "không",
+    "D8.3.2": "không",
+    "D8.3.3": "không",
+    "D8.4.1": "không",
+    "D8.4.2": "không",
+    "D8.4.3": "không",
+    "D8.4.4": "không",
+    "D8.5.1": "không",
+    // Chọn "Hầu như không"
+    "D6.1": "hầu như không",
+    "D6.2": "hầu như không",
+    "D6.3": "hầu như không",
+    "D6.4": "hầu như không",
+    "D6.5": "hầu như không",
+    "D6.6": "hầu như không",
+    "D6.7": "hầu như không",
+    "D6.8": "hầu như không",
+    "D6.9": "hầu như không",
+    "D7.1": "hầu như không",
+    "D7.2": "hầu như không",
+    "D7.3": "hầu như không",
+    "D7.4": "hầu như không",
+    "D7.5": "hầu như không",
+    "D7.6": "hầu như không",
+    "D7.7": "hầu như không",
+    // Chọn "Có"
+    "D8.1.1": "có",
+    "D8.1.2": "có",
+    "D8.1.3": "có",
+    "D8.1.4": "có",
+    "D8.1.5": "có",
+    "D8.1.6": "có",
+    "D8.2.1": "có",
+    "D8.2.2": "có",
+    "D8.2.3": "có",
+    "D8.2.4": "có",
+    "D8.2.5": "có",
+    "D8.2.6": "có",
+    "D8.2.7": "có",
+    "D8.2.8": "có"
+  };
+  var CAN_LAM_SANG_REFERENCE = [
+    {
+      "column": "RBC",
+      "label": "Số lượng HC",
+      "min": 3.8,
+      "max": 5.6
+    },
+    {
+      "column": "HGB",
+      "label": "Huyết sắc tố",
+      "min": 120,
+      "max": 180
+    },
+    {
+      "column": "HCT",
+      "label": "Hematocrit",
+      "min": 0.35,
+      "max": 0.52
+    },
+    {
+      "column": "MCV",
+      "label": "MCV",
+      "min": 80,
+      "max": 97
+    },
+    {
+      "column": "MCH",
+      "label": "MCH",
+      "min": 26,
+      "max": 32
+    },
+    {
+      "column": "MCHC",
+      "label": "MCHC",
+      "min": 310,
+      "max": 360
+    },
+    {
+      "column": "RDW",
+      "label": "RDW",
+      "min": 11,
+      "max": 15.7
+    },
+    {
+      "column": "WBC",
+      "label": "Số lượng bạch cầu",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "column": "NEU#",
+      "label": "BC trung tính",
+      "min": 1.7,
+      "max": 7
+    },
+    {
+      "column": "LYM#",
+      "label": "BC lympho",
+      "min": 1,
+      "max": 4
+    },
+    {
+      "column": "MONO#",
+      "label": "BC đơn nhân",
+      "min": 0.1,
+      "max": 1
+    },
+    {
+      "column": "EOS#",
+      "label": "BC ái toan",
+      "min": 0,
+      "max": 0.5
+    },
+    {
+      "column": "BASO#",
+      "label": "BC ái kiềm",
+      "min": 0,
+      "max": 0.2
+    },
+    {
+      "column": "PLT",
+      "label": "Tiểu cầu",
+      "min": 130,
+      "max": 400
+    },
+    {
+      "column": "Glucose",
+      "label": "Đường máu",
+      "min": 3.9,
+      "max": 5.5
+    },
+    {
+      "column": "Ure",
+      "label": "Urê",
+      "min": 2.5,
+      "max": 7.5
+    },
+    {
+      "column": "Creatinine",
+      "label": "Creatinin",
+      "min": 45,
+      "max": 105,
+      "maleMin": 60,
+      "maleMax": 105,
+      "femaleMin": 45,
+      "femaleMax": 80
+    },
+    {
+      "column": "AST",
+      "label": "ASAT(GOT)",
+      "min": 13,
+      "max": 31
+    },
+    {
+      "column": "ALT",
+      "label": "ALAT(GPT)",
+      "min": 7,
+      "max": 40
+    },
+    {
+      "column": "S.G",
+      "label": "Tỉ trọng nước tiểu",
+      "min": 1.005,
+      "max": 1.03
+    },
+    {
+      "column": "pH",
+      "label": "pH nước tiểu",
+      "min": 5,
+      "max": 8
+    },
+    {
+      "column": "LEU",
+      "label": "Bạch cầu niệu",
+      "min": 0,
+      "max": 0
+    },
+    {
+      "column": "BLD",
+      "label": "Hồng cầu niệu",
+      "min": 0,
+      "max": 0
+    },
+    {
+      "column": "PRO",
+      "label": "Protein niệu",
+      "min": 0,
+      "max": 0
+    },
+    {
+      "column": "GLU",
+      "label": "Glucose niệu",
+      "min": 0,
+      "max": 0
+    },
+    {
+      "column": "KET",
+      "label": "Thể cetonic niệu",
+      "min": 0,
+      "max": 0
+    },
+    {
+      "column": "BIL",
+      "label": "Bilirubin niệu",
+      "min": 0,
+      "max": 0
+    },
+    {
+      "column": "URO",
+      "label": "Urobilinogen niệu",
+      "min": 0,
+      "max": 17
+    }
+  ];
+  var CLS_ALERT_CONFIG = {
+    "RBC": {
+      "label": "Số lượng hồng cầu",
+      "unit": "T/L",
+      "detailOnly": true
+    },
+    "HGB": {
+      "label": "Huyết sắc tố",
+      "unit": "g/L",
+      "actionLow": 110,
+      "actionHigh": 180,
+      "urgentLow": 80
+    },
+    "HCT": {
+      "label": "Hematocrit",
+      "unit": "L/L",
+      "detailOnly": true
+    },
+    "MCV": {
+      "label": "MCV",
+      "unit": "fL",
+      "actionLow": 70,
+      "actionHigh": 110
+    },
+    "MCH": {
+      "label": "MCH",
+      "unit": "pg",
+      "detailOnly": true
+    },
+    "MCHC": {
+      "label": "MCHC",
+      "unit": "g/L",
+      "detailOnly": true
+    },
+    "RDW": {
+      "label": "RDW",
+      "unit": "%",
+      "detailOnly": true
+    },
+    "WBC": {
+      "label": "Số lượng bạch cầu",
+      "unit": "G/L",
+      "actionLow": 3,
+      "actionHigh": 12,
+      "urgentLow": 2,
+      "urgentHigh": 30
+    },
+    "NEU#": {
+      "label": "Số lượng bạch cầu trung tính",
+      "unit": "G/L",
+      "actionLow": 1.5,
+      "actionHigh": 10,
+      "urgentLow": 0.5
+    },
+    "LYM#": {
+      "label": "Số lượng bạch cầu lympho",
+      "unit": "G/L",
+      "actionLow": 0.5,
+      "actionHigh": 5
+    },
+    "MONO#": {
+      "label": "Số lượng bạch cầu đơn nhân",
+      "unit": "G/L",
+      "actionHigh": 1.5
+    },
+    "EOS#": {
+      "label": "Số lượng bạch cầu ái toan",
+      "unit": "G/L",
+      "actionHigh": 1.5
+    },
+    "BASO#": {
+      "label": "Số lượng bạch cầu ái kiềm",
+      "unit": "G/L",
+      "detailOnly": true
+    },
+    "PLT": {
+      "label": "Số lượng tiểu cầu",
+      "unit": "G/L",
+      "actionLow": 100,
+      "actionHigh": 450,
+      "urgentLow": 50,
+      "urgentHigh": 1e3
+    },
+    "Glucose": {
+      "label": "Glucose máu",
+      "unit": "mmol/L",
+      "actionLow": 3.9,
+      "actionHigh": 7,
+      "actionHighExclusive": true,
+      "urgentLow": 3,
+      "urgentHigh": 20
+    },
+    "Ure": {
+      "label": "Urê",
+      "unit": "mmol/L",
+      "actionHigh": 10
+    },
+    "Creatinine": {
+      "label": "Creatinin",
+      "unit": "µmol/L",
+      "actionHigh": 130,
+      "urgentHigh": 300
+    },
+    "AST": {
+      "label": "AST",
+      "unit": "U/L",
+      "actionHighRatio": 1.5,
+      "urgentHighRatio": 10
+    },
+    "ALT": {
+      "label": "ALT",
+      "unit": "U/L",
+      "actionHighRatio": 1.5,
+      "urgentHighRatio": 10
+    },
+    "S.G": {
+      "label": "Tỉ trọng nước tiểu",
+      "unit": "",
+      "detailOnly": true
+    },
+    "pH": {
+      "label": "pH nước tiểu",
+      "unit": "",
+      "detailOnly": true
+    },
+    "LEU": {
+      "label": "Bạch cầu niệu",
+      "unit": "cells/µL",
+      "urine": true,
+      "actionHigh": 75,
+      "actionGrade": 2
+    },
+    "BLD": {
+      "label": "Hồng cầu niệu",
+      "unit": "cells/µL",
+      "urine": true,
+      "actionHigh": 50,
+      "actionGrade": 2
+    },
+    "PRO": {
+      "label": "Protein niệu",
+      "unit": "g/L",
+      "urine": true,
+      "actionHigh": 1,
+      "actionGrade": 2
+    },
+    "GLU": {
+      "label": "Glucose niệu",
+      "unit": "mmol/L",
+      "urine": true,
+      "actionHigh": 5.5,
+      "actionGrade": 1
+    },
+    "KET": {
+      "label": "Ceton niệu",
+      "unit": "mmol/L",
+      "urine": true,
+      "actionHigh": 1.5,
+      "actionGrade": 2
+    },
+    "BIL": {
+      "label": "Bilirubin niệu",
+      "unit": "µmol/L",
+      "urine": true,
+      "actionHigh": 17,
+      "actionGrade": 1
+    },
+    "URO": {
+      "label": "Urobilinogen niệu",
+      "unit": "µmol/L",
+      "urine": true,
+      "actionHigh": 34,
+      "actionGrade": 2
+    }
+  };
+  var REFERRAL_DEPARTMENTS = [
+    "Nội tổng hợp",
+    "Nội tiết",
+    "Nội tim mạch",
+    "Nội thận lọc máu",
+    "Nội Thần kinh Cơ xương khớp",
+    "Mắt",
+    "Răng Hàm Mặt",
+    "Tai Mũi Họng",
+    "Da liễu",
+    "Ngoại tổng hợp",
+    "Ngoại chấn thương chỉnh hình",
+    "Sản phụ khoa",
+    "Nhi",
+    "Truyền nhiễm"
+  ];
+  var REFERRAL_ROUTING = [
+    { name: "Mắt", codes: [["H", 0, 59]], words: /khuc xa|can thi|vien thi|loan thi|duc thuy tinh|glocom|glaucoma|ket mac|giac mac|vong mac|giam thi luc|benh mat/ },
+    { name: "Răng Hàm Mặt", codes: [["K", 0, 14]], words: /sau rang|viem loi|viem nuou|nha chu|rang ham mat|mat rang|viem tuy rang/ },
+    { name: "Tai Mũi Họng", codes: [["H", 60, 95], ["J", 0, 6], ["J", 30, 39]], words: /viem xoang|viem mui|viem hong|viem tai|amidan|giam thinh luc|tai mui hong|polyp mui/ },
+    { name: "Nội tiết", codes: [["E", 0, 35], ["E", 65, 68], ["E", 78, 78]], words: /dai thao duong|tieu duong|tuyen giap|cuong giap|suy giap|buou giap|roi loan lipid|roi loan mo mau|beo phi/ },
+    { name: "Nội tim mạch", codes: [["I", 0, 52]], words: /tang huyet ap|benh tim|suy tim|mach vanh|roi loan nhip|rung nhi|benh van tim/ },
+    { name: "Nội thận lọc máu", codes: [["N", 0, 19], ["N", 25, 29]], words: /suy than|benh than|viem cau than|than man|hoi chung than hu/ },
+    { name: "Nội Thần kinh Cơ xương khớp", codes: [["G", 0, 99], ["M", 0, 99], ["I", 60, 69]], words: /dau dau|dau nua dau|dong kinh|parkinson|dau khop|viem khop|thoai hoa|cot song|\bgout\b|\bgut\b|loang xuong|dot quy|tai bien mach mau nao/ },
+    { name: "Da liễu", codes: [["L", 0, 99], ["B", 35, 36]], words: /viem da|benh da|nam da|vay nen|cham da|me day|mun trung ca/ },
+    { name: "Ngoại chấn thương chỉnh hình", codes: [], words: /gay xuong|chan thuong (xuong|khop|chi)|trat khop|bong gan/ },
+    { name: "Sản phụ khoa", codes: [["N", 70, 98], ["O", 0, 99]], words: /phu khoa|viem am dao|u xo tu cung|u nang buong trung|roi loan kinh nguyet/ },
+    { name: "Truyền nhiễm", codes: [["B", 15, 24]], words: /viem gan (b|c|virus|sieu vi)|sot xuat huyet|sot ret|hiv/ },
+    { name: "Ngoại tổng hợp", codes: [["K", 35, 46], ["K", 80, 83]], words: /thoat vi ben|tri noi|tri ngoai|benh tri|soi tui mat|viem ruot thua/ },
+    { name: "Nội tổng hợp", codes: [["D", 50, 89], ["J", 10, 22], ["J", 40, 99], ["K", 20, 31], ["K", 50, 67], ["K", 70, 77]], words: /thieu mau|viem da day|trao nguoc|viem gan khong|gan nhiem mo|hen phe quan|benh phoi tac nghen|viem phe quan/ },
+    { name: "Nhi", codes: [], words: /kham nhi|chuyen khoa nhi|benh ly nhi khoa/ }
+  ];
+  var REFERRAL_PUBLIC_GROUPS = {
+    "Nội tổng hợp": "nội khoa",
+    "Nội tiết": "nội tiết",
+    "Nội tim mạch": "tim mạch",
+    "Nội thận lọc máu": "thận",
+    "Nội Thần kinh Cơ xương khớp": "thần kinh hoặc cơ xương khớp",
+    "Mắt": "mắt",
+    "Răng Hàm Mặt": "răng hàm mặt",
+    "Tai Mũi Họng": "tai mũi họng",
+    "Da liễu": "da",
+    "Ngoại tổng hợp": "ngoại khoa",
+    "Ngoại chấn thương chỉnh hình": "chấn thương chỉnh hình",
+    "Sản phụ khoa": "sản phụ khoa",
+    "Nhi": "sức khỏe trẻ em"
+  };
+  function normalizeColKey(s) {
+    return (s || "").toString().toLowerCase().replace(
+      /\s+/g,
+      ""
+    );
+  }
+  function getDataValueByColumn(data, column) {
+    if (data[column] !== void 0) {
+      return data[column];
+    }
+    const target = normalizeColKey(
+      column
+    );
+    const foundKey = Object.keys(
+      data
+    ).find(
+      (k) => normalizeColKey(k) === target
+    );
+    return foundKey ? data[foundKey] : void 0;
+  }
+  function getRefRange(ref, sex) {
+    if (sex === "M" && ref.maleMin !== void 0) return { min: ref.maleMin, max: ref.maleMax };
+    if (sex === "F" && ref.femaleMin !== void 0) return { min: ref.femaleMin, max: ref.femaleMax };
+    return { min: ref.min, max: ref.max };
+  }
+  function clsNumber(value) {
+    const str = String(value ?? "").trim().replace(",", ".");
+    return /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(str) ? Number(str) : NaN;
+  }
+  function clsText(value) {
+    return String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").toLowerCase().trim();
+  }
+  function clsUnit(value) {
+    return String(value ?? "").toLowerCase().replace(/[μµ]/g, "u").replace(/\s/g, "");
+  }
+  function clsUnitMatches(actual, expected) {
+    const aliases = { "t/l": ["t/l", "10^12/l", "10¹²/l", "m/ul"], "g/l": ["g/l", "10^9/l", "10⁹/l", "k/ul"], "l/l": ["l/l"], "umol/l": ["umol/l"], "cells/ul": ["cells/ul", "cell/ul", "/ul", "leu/ul", "ery/ul"] };
+    const key = clsUnit(expected);
+    if (expected === "g/L") return String(actual).trim() !== "G/L" && clsUnit(actual) === "g/l";
+    if (expected === "G/L" && String(actual).trim() === "g/L") return false;
+    return (aliases[key] || [key]).includes(clsUnit(actual));
+  }
+  function clsParseUrine(raw) {
+    const text = clsText(raw).replace(/\s/g, "");
+    if (["am", "amtinh", "negative", "neg", "binhthuong", "normal", "-", "0"].includes(text)) return { value: 0 };
+    if (["trace", "vet", "+/-", "±"].includes(text)) return { grade: 0.5 };
+    if (/^\+{1,4}$/.test(text)) return { grade: text.length };
+    if (/^[1-4]\+$/.test(text)) return { grade: Number(text[0]) };
+    if (["duong", "duongtinh", "positive", "pos"].includes(text)) return { positive: true };
+    const value = clsNumber(raw);
+    return Number.isFinite(value) ? { value } : { invalid: true };
+  }
+  function checkAbnormalResults(data) {
+    const get = (column) => getDataValueByColumn(data, column);
+    const sexText = clsText(get("Giới tính"));
+    const sex = ["m", "nam", "male"].includes(sexText) ? "M" : ["f", "nu", "female"].includes(sexText) ? "F" : "";
+    const age = clsNumber(get("Tuổi thực"));
+    const model = typeof getCurrentMedinetModel === "function" ? getCurrentMedinetModel() : "";
+    const child = Number.isFinite(age) && age < 18 || !Number.isFinite(age) && model === "M2";
+    const pregnant = ["co", "yes", "true", "1"].includes(clsText(get("Mang thai")));
+    const fastingText = clsText(get("Glucose đói") || get("Lấy máu lúc đói"));
+    const fasting = ["co", "yes", "true", "1", "doi", "luc doi"].includes(fastingText);
+    const result = [];
+    const add = (ref, raw, range, level, direction, note) => result.push({ column: ref.column, label: ref.label, value: String(raw), unit: ref.urine && !Number.isFinite(clsNumber(raw)) ? "" : ref.unit, rangeText: `${range.min}–${range.max}${ref.unit ? " " + ref.unit : ""}`, level, direction, note: note || "" });
+    for (const reference of CAN_LAM_SANG_REFERENCE) {
+      const ref = { ...reference, ...CLS_ALERT_CONFIG[reference.column] };
+      const original = get(ref.column);
+      if (original === void 0 || original === null || String(original).trim() === "") continue;
+      let range = getRefRange(ref, sex);
+      const raw = ref.column === "S.G" ? normalizeSpecificGravity(original) : original;
+      const parsed = ref.urine ? clsParseUrine(raw) : { value: clsNumber(raw) };
+      const explicitUnit = get(ref.column + "_UNIT");
+      if (explicitUnit && !clsUnitMatches(explicitUnit, ref.unit)) {
+        add(ref, original, range, "review", null, `Chưa đánh giá: đơn vị nguồn ${explicitUnit}; cấu hình yêu cầu ${ref.unit}.`);
+        continue;
+      }
+      if (parsed.invalid || !ref.urine && !Number.isFinite(parsed.value)) {
+        add(ref, original, range, "review", null, "Chưa đánh giá: kết quả không phải số hoàn chỉnh hoặc cần xác nhận cách ghi.");
+        continue;
+      }
+      if (ref.urine) {
+        if (parsed.positive) {
+          add(ref, original, range, "review", null, "Dương tính nhưng chưa có mức độ; bác sĩ kiểm tra trước khi đưa vào kết luận.");
+          continue;
+        }
+        const grade = parsed.grade;
+        const n2 = parsed.value;
+        if (n2 !== void 0 && n2 < 0) {
+          add(ref, original, range, "review", null, "Giá trị âm không hợp lệ.");
+          continue;
+        }
+        if (grade !== void 0 && grade > 0 || n2 !== void 0 && n2 > range.max) {
+          const active = grade !== void 0 ? grade >= ref.actionGrade : n2 >= ref.actionHigh;
+          add(ref, original, range, active ? "action" : "mild", "dương tính", grade === 0.5 ? "Mức vết: xem lại mẫu và bối cảnh lâm sàng." : "Đối chiếu mẫu, đơn vị và mức dương tính; không suy ra bệnh.");
+        }
+        continue;
+      }
+      const n = parsed.value;
+      if (n < 0 || ref.column === "HGB" && n > 0 && n < 25 || ref.column === "HCT" && n > 1 || ref.column === "MCHC" && n > 0 && n < 100 || ref.column === "S.G" && (n < 1 || n > 1.1) || ref.column === "pH" && n > 14) {
+        add(ref, original, range, "review", null, "Chưa đánh giá: kiểm tra giá trị và đơn vị nguồn. Không tự quy đổi.");
+        continue;
+      }
+      if (ref.maleMin !== void 0 && !sex) {
+        add(ref, original, range, "review", null, "Chưa rõ giới tính; cần xác minh trước khi dùng ngưỡng theo giới.");
+        continue;
+      }
+      const low = n < range.min, high = n > range.max;
+      if (child || pregnant && ["HGB", "HCT", "RBC", "Creatinine"].includes(ref.column)) {
+        add(ref, original, range, "review", null, child ? "Chưa có bộ ngưỡng nhi khoa theo tuổi; cần bác sĩ đánh giá." : "Cần khoảng tham chiếu theo thai kỳ; cần bác sĩ đánh giá.");
+        continue;
+      }
+      if (!low && !high) continue;
+      const direction = low ? "thấp" : "cao";
+      let level = "mild";
+      let note = "Lệch khoảng tham chiếu; chưa đạt ngưỡng đề nghị khám của cấu hình.";
+      const actionHigh = ref.actionHighRatio ? range.max * ref.actionHighRatio : ref.actionHigh;
+      const urgentHigh = ref.urgentHighRatio ? range.max * ref.urgentHighRatio : ref.urgentHigh;
+      if (!ref.detailOnly) {
+        if (low && ref.actionLow !== void 0 && n < ref.actionLow || high && actionHigh !== void 0 && (ref.actionHighExclusive ? n > actionHigh : n >= actionHigh)) level = "action";
+        if (low && ref.urgentLow !== void 0 && n < ref.urgentLow || high && urgentHigh !== void 0 && n >= urgentHigh) level = "urgent";
+      }
+      if (level === "action") note = "Đạt ngưỡng sàng lọc đề nghị khám của cấu hình; bác sĩ đối chiếu lâm sàng.";
+      if (level === "urgent") note = "Cần bác sĩ đánh giá ngay mức độ và hướng xử trí; không chờ lời dặn khám thông thường.";
+      if (ref.detailOnly) note = "Chỉ số hỗ trợ: xem phối hợp, không tự tạo đề nghị khám từ chỉ số này.";
+      if (ref.column === "Glucose" && !fasting) note += " Chưa xác nhận lấy máu lúc đói; không suy ra chẩn đoán đái tháo đường.";
+      if (child && !ref.urine && !["S.G", "pH"].includes(ref.column)) {
+        level = "review";
+        note = "Chưa có bộ ngưỡng nhi khoa theo tuổi; bác sĩ đánh giá, không áp dụng ngưỡng người lớn.";
+      }
+      if (pregnant && ["HGB", "HCT", "RBC", "Creatinine"].includes(ref.column)) {
+        level = "review";
+        note = "Cần khoảng tham chiếu theo thai kỳ; không tự áp dụng bộ ngưỡng này.";
+      }
+      if (level === "mild" && ref.maleMin !== void 0 && !sex) note += " Chưa rõ giới tính, đang dùng khoảng chung.";
+      add(ref, original, range, level, direction, note);
+    }
+    const nitRaw = get("NIT");
+    if (nitRaw !== void 0 && nitRaw !== null && String(nitRaw).trim() !== "") {
+      const text = clsText(nitRaw).replace(/\s/g, "");
+      if (["1", "+", "duong", "duongtinh", "positive", "pos", "true"].includes(text)) {
+        result.push({ column: "NIT", label: "Nitrit niệu", value: "Dương tính", rangeText: "Âm tính", level: "action", direction: "dương tính", note: "Không tự suy ra nhiễm khuẩn tiết niệu." });
+      } else if (!["0", "-", "am", "amtinh", "negative", "neg", "false"].includes(text)) {
+        result.push({ column: "NIT", label: "Nitrit niệu", value: String(nitRaw), rangeText: "Âm tính", level: "review", direction: null, note: "Chưa nhận diện kết quả định tính; cần kiểm tra." });
+      }
+    }
+    const totalWbc = clsNumber(get("WBC"));
+    if (Number.isFinite(totalWbc) && totalWbc >= 0 && !result.some((f) => f.column === "WBC" && f.level === "review")) {
+      let invalidDifferential = false;
+      for (const column of ["NEU#", "LYM#", "MONO#", "EOS#", "BASO#"]) {
+        const n = clsNumber(get(column));
+        if (Number.isFinite(n) && n > totalWbc + 0.2) {
+          invalidDifferential = true;
+          let f = result.find((f2) => f2.column === column);
+          if (!f) {
+            const reference = CAN_LAM_SANG_REFERENCE.find((r) => r.column === column);
+            const ref = { ...reference, ...CLS_ALERT_CONFIG[column] };
+            add(ref, get(column), getRefRange(ref, sex), "review", null, "");
+            f = result[result.length - 1];
+          }
+          f.level = "review";
+          f.note = "Số lượng thành phần lớn hơn tổng bạch cầu; kiểm tra dữ liệu và đơn vị.";
+        }
+      }
+      if (invalidDifferential) {
+        const wbcFinding = result.find((f) => f.column === "WBC");
+        if (wbcFinding) {
+          wbcFinding.level = "review";
+          wbcFinding.note = "Công thức bạch cầu không nhất quán; kiểm tra nguồn trước khi diễn giải.";
+        }
+      }
+    }
+    return evaluateClsGroups(data, result, sex);
+  }
+  function clsGroupId(column) {
+    if (["RBC", "HGB", "HCT", "MCV", "MCH", "MCHC", "RDW"].includes(column)) return "red";
+    if (["WBC", "NEU#", "LYM#", "MONO#", "EOS#", "BASO#"].includes(column)) return "white";
+    if (column === "PLT") return "platelet";
+    if (["AST", "ALT"].includes(column)) return "liver";
+    if (["Ure", "Creatinine"].includes(column)) return "kidney";
+    if (column === "Glucose") return "glucose";
+    return "urine";
+  }
+  function evaluateClsGroups(data, findings, sex) {
+    const value = (column) => clsNumber(getDataValueByColumn(data, column));
+    const find = (column) => findings.find((f) => f.column === column && f.level !== "review");
+    const usable = (column) => !findings.some((f) => f.column === column && f.level === "review");
+    const num = (column) => usable(column) ? value(column) : NaN;
+    const yes = (column) => ["co", "yes", "true", "1"].includes(clsText(getDataValueByColumn(data, column)));
+    const qualify = (id, columns, reason, urgent = false) => {
+      columns.forEach((column) => {
+        const f = find(column);
+        if (!f) return;
+        f.groupId = id;
+        f.groupReason = reason;
+        if (f.level !== "urgent") f.level = urgent ? "urgent" : "action";
+      });
+    };
+    findings.forEach((f) => {
+      f.groupId = clsGroupId(f.column);
+      f.candidateLevel = f.level;
+      f.groupReason = "";
+      if (f.level === "action") f.level = "mild";
+    });
+    findings.filter((f) => f.level === "urgent").forEach((f) => {
+      f.groupReason = "Giá trị đạt ngưỡng cần bác sĩ đánh giá ngay.";
+    });
+    const hb = num("HGB"), wbc = num("WBC"), plt = num("PLT"), neu = num("NEU#"), lym = num("LYM#");
+    if (hb < 110 || hb >= 180) qualify("red", ["HGB"], "Huyết sắc tố đạt mức đáng kể của bộ quy tắc.");
+    if (hb < (sex === "M" ? 120 : 110) && (num("MCV") < 70 || num("MCV") >= 110))
+      qualify("red", ["HGB", "MCV"], "Huyết sắc tố giảm kèm MCV lệch rõ.");
+    if (num("HCT") >= 0.55 && num("RBC") >= 6)
+      qualify("red", ["RBC", "HCT"], "Hồng cầu và hematocrit cùng tăng rõ.");
+    const lowLines = [];
+    if (hb < (sex === "M" ? 120 : 110)) lowLines.push("HGB");
+    if (wbc < 3.5) lowLines.push("WBC");
+    if (plt < 120) lowLines.push("PLT");
+    if (neu < 1.5) qualify("white", ["NEU#"], "Số lượng bạch cầu trung tính giảm rõ.");
+    if (wbc < 3 || wbc >= 12) qualify("white", ["WBC"], "Tổng số bạch cầu đạt mức đáng kể.");
+    if (wbc >= 12 && neu >= 10) qualify("white", ["WBC", "NEU#"], "Tổng bạch cầu và bạch cầu trung tính cùng tăng rõ.");
+    if (lym > 5 && (hb < 100 || plt < 100 || yes("LYM_CanKham")))
+      qualify("white", ["LYM#"], "Lympho tăng kèm dòng tế bào giảm rõ hoặc bác sĩ đã xác nhận cần khám.");
+    if (lym >= 10 && wbc >= 20)
+      qualify("white", ["WBC", "LYM#"], "Lympho tăng rõ kèm tổng số bạch cầu tăng rõ.");
+    if (num("EOS#") >= 1.5)
+      qualify("white", ["EOS#"], "Ái toan đạt ngưỡng đề nghị khám của bản thử.");
+    if (num("MONO#") >= 1.5 && wbc >= 20)
+      qualify("white", ["WBC", "MONO#"], "Bạch cầu đơn nhân tăng kèm tổng số bạch cầu tăng rõ.");
+    if (plt < 100 || plt >= 450)
+      qualify("platelet", ["PLT"], "Tiểu cầu đạt ngưỡng đề nghị khám của bản thử.");
+    const astRef = CAN_LAM_SANG_REFERENCE.find((r) => r.column === "AST");
+    const altRef = CAN_LAM_SANG_REFERENCE.find((r) => r.column === "ALT");
+    const astRatio = num("AST") / getRefRange(astRef, sex).max;
+    const altRatio = num("ALT") / getRefRange(altRef, sex).max;
+    if (astRatio >= 1.5) qualify("liver", ["AST"], "AST đạt ít nhất 1,5 lần giới hạn trên.");
+    if (altRatio >= 1.5) qualify("liver", ["ALT"], "ALT đạt ít nhất 1,5 lần giới hạn trên.");
+    if (astRatio >= 1.5 && altRatio >= 1.5)
+      qualify("liver", ["AST", "ALT"], "AST và ALT cùng tăng ít nhất 1,5 lần giới hạn trên.");
+    const crRef = CAN_LAM_SANG_REFERENCE.find((r) => r.column === "Creatinine");
+    const crUpper = getRefRange(crRef, sex).max;
+    if (num("Creatinine") >= 1.25 * crUpper)
+      qualify("kidney", ["Creatinine"], "Creatinin tăng ít nhất 1,25 lần giới hạn trên.");
+    if (num("Creatinine") > crUpper + 10 && num("Ure") >= 10)
+      qualify("kidney", ["Creatinine", "Ure"], "Creatinin và urê cùng tăng vượt mức phối hợp.");
+    if (num("Ure") >= 10) qualify("kidney", ["Ure"], "Urê đạt ngưỡng đề nghị khám của bản thử.");
+    const sugar = find("Glucose");
+    if (sugar && ["action", "urgent"].includes(sugar.candidateLevel))
+      qualify("glucose", ["Glucose"], "Glucose đạt ngưỡng độc lập; không suy ra chẩn đoán.");
+    const gradeOrValue = (column, numeric2, grade) => {
+      if (!usable(column)) return false;
+      const p = clsParseUrine(getDataValueByColumn(data, column));
+      return p.value !== void 0 && p.value >= numeric2 || p.grade !== void 0 && p.grade >= grade;
+    };
+    if (find("NIT") && gradeOrValue("LEU", 75, 2))
+      qualify("urine", ["NIT", "LEU"], "Nitrit dương tính kèm bạch cầu niệu tăng rõ.");
+    if (gradeOrValue("PRO", 1, 2)) qualify("urine", ["PRO"], "Protein niệu đạt mức đáng kể.");
+    if (gradeOrValue("BLD", 50, 2)) qualify("urine", ["BLD"], "Hồng cầu niệu đạt mức đáng kể.");
+    if (gradeOrValue("BIL", 17, 1)) qualify("urine", ["BIL"], "Bilirubin niệu dương tính ở mức đã xác định.");
+    if (gradeOrValue("URO", 34, 2)) qualify("urine", ["URO"], "Urobilinogen niệu tăng rõ.");
+    if (gradeOrValue("GLU", 5.5, 1))
+      qualify("urine", ["GLU"], "Glucose niệu tăng rõ hoặc đi kèm glucose máu đạt ngưỡng.");
+    if (gradeOrValue("KET", 1.5, 2)) qualify("urine", ["KET"], "Ceton niệu đạt mức đáng kể.");
+    if (sugar && num("Glucose") >= 11.1 && sugar.direction === "cao" && ["action", "urgent"].includes(sugar.level) && gradeOrValue("KET", 1.5, 2))
+      qualify("glucose", ["Glucose", "KET"], "Glucose máu tăng kèm ceton niệu rõ.", true);
+    if (lowLines.length >= 2) qualify("multiple", lowLines, "Ít nhất hai dòng tế bào giảm vượt mức phối hợp đã cấu hình.");
+    findings.forEach((f) => {
+      if (f.level !== "review") f.note = "";
+    });
+    return findings;
+  }
+  function referralPlain(text) {
+    return norm2(text).normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d");
+  }
+  function cleanReferralDiseases(text) {
+    return String(text || "").replace(/Chẩn đoán\s*(sơ bộ|xác định)\s*:/gi, "\n").split(/\n|;/).map((t) => t.replace(/^\s*(?:[-•]+|\d+[.)])\s*/, "").trim()).filter((t) => {
+      const plain = referralPlain(t).replace(/[.!:]+$/, "");
+      return plain && !/^(khong co|khong|chua phat hien (benh|bat thuong)|binh thuong|khong phat hien bat thuong)$/.test(plain);
+    }).filter((t, i, all2) => all2.findIndex((v) => referralPlain(v) === referralPlain(t)) === i).join("; ");
+  }
+  function analyzeReferralDepartments(diseases, findings) {
+    const selected2 = /* @__PURE__ */ new Set(), unknown = [];
+    for (const part of cleanReferralDiseases(diseases).split(/;|\n/)) {
+      const plain = referralPlain(part);
+      if (!plain || /^(khong|chua phat hien|loai tru)\b/.test(plain)) continue;
+      const codes = Array.from(plain.matchAll(/\b([a-z])(\d{2})(?:\.\d+)?\b/g));
+      const routed = /* @__PURE__ */ new Set();
+      let unmatchedCode = false;
+      for (const match of codes) {
+        let codeMatched = false;
+        const letter = match[1].toUpperCase(), n = Number(match[2]);
+        for (const rule of REFERRAL_ROUTING) if (rule.codes.some(([prefix, low, high]) => letter === prefix && n >= low && n <= high)) {
+          routed.add(rule.name);
+          codeMatched = true;
+        }
+        if (letter === "S" && n >= 40 && n <= 99) {
+          routed.add("Ngoại chấn thương chỉnh hình");
+          codeMatched = true;
+        }
+        if (!codeMatched) unmatchedCode = true;
+      }
+      if (!codes.length) {
+        for (const rule of REFERRAL_ROUTING) if (rule.words.test(plain)) routed.add(rule.name);
+      }
+      if (!routed.size || unmatchedCode) unknown.push(part);
+      routed.forEach((name) => selected2.add(name));
+    }
+    for (const finding of findings || []) {
+      if (!["action", "urgent"].includes(finding.level)) continue;
+      const key = String(finding.key || finding.code || ""), label = referralPlain(finding.label || "");
+      if (/glucose|duong mau/.test(label) || key === "Glucose") selected2.add("Nội tiết");
+      else if (/creatinin|\bure\b|protein nieu|hong cau nieu/.test(label) || ["Creatinin", "Ure", "PRO", "BLD"].includes(key)) selected2.add("Nội thận lọc máu");
+      else selected2.add("Nội tổng hợp");
+    }
+    return { departments: REFERRAL_DEPARTMENTS.filter((name) => selected2.has(name)), unknown };
+  }
+  function buildReferralObservation(findings) {
+    const selected2 = (findings || []).filter((f) => ["action", "urgent"].includes(f.level));
+    const parts = [];
+    for (const [direction, word] of [["cao", "tăng"], ["thấp", "giảm"], ["dương tính", "dương tính"]]) {
+      const labels = [...new Set(selected2.filter((f) => f.direction === direction).map((f) => /^[A-Z0-9.#]+$/.test(f.label) ? f.label : f.label[0].toLowerCase() + f.label.slice(1)))];
+      if (labels.length) parts.push(labels.join(", ") + " " + word);
+    }
+    if (!parts.length) return "";
+    const joined = parts.length < 2 ? parts[0] : parts.slice(0, -1).join(", ") + " và " + parts[parts.length - 1];
+    return "Kết quả xét nghiệm ghi nhận " + joined + ".";
+  }
+  function buildPublicDiseaseObservation(diseases) {
+    const cleaned = cleanReferralDiseases(diseases);
+    if (!cleaned) return "";
+    const routing = analyzeReferralDepartments(cleaned, []);
+    const groups = [...new Set(routing.departments.map((name) => REFERRAL_PUBLIC_GROUPS[name]).filter(Boolean))];
+    const phrases = [];
+    if (groups.length) {
+      const joined = groups.length === 1 ? groups[0] : groups.slice(0, -1).join(", ") + " và " + groups[groups.length - 1];
+      phrases.push("bất thường về " + joined);
+    }
+    if (routing.unknown.length || routing.departments.includes("Truyền nhiễm")) phrases.push(phrases.length ? "một số bất thường khác cần được kiểm tra thêm" : "bất thường cần được kiểm tra thêm");
+    if (!phrases.length) return "";
+    return "Kết quả khám ghi nhận " + phrases.join(" và ") + ".";
+  }
+  function buildCombinedReferralObservation(diseases, findings) {
+    return [buildPublicDiseaseObservation(diseases), buildReferralObservation(findings)].filter(Boolean).join("\n");
+  }
+  function buildReferralProposal(observation, departments) {
+    const chosen = REFERRAL_DEPARTMENTS.filter((name) => (departments || []).includes(name));
+    const first = String(observation || "").trim();
+    if (!chosen.length) return "";
+    const names = chosen.length === 1 ? chosen[0] : chosen.slice(0, -1).join(", ") + " và " + chosen[chosen.length - 1];
+    return (first ? first + "\n" : "") + "Đề nghị người dân đến khám chuyên khoa " + names + " tại Bệnh viện Đa khoa khu vực Hóc Môn để được khám và tư vấn chi tiết hơn.";
+  }
+  var ICD_SPECIALTY_MAP = [
+    { test: (c) => /^K(0[0-9]|1[0-4])/.test(c), text: "Khám Răng" },
+    { test: (c) => /^H([0-4][0-9]|5[0-9])/.test(c), text: "Khám Mắt" },
+    { test: (c) => /^H([6-9][0-9])/.test(c), text: "Khám Tai Mũi Họng" },
+    { test: (c) => /^J[0-9]{2}/.test(c), text: "Khám Hô hấp" },
+    { test: (c) => /^I[0-9]{2}/.test(c), text: "Khám Tim mạch" },
+    { test: (c) => /^K(2[0-9]|[3-9][0-9])/.test(c), text: "Khám Tiêu hóa" },
+    { test: (c) => /^L[0-9]{2}/.test(c), text: "Khám Da liễu" },
+    { test: (c) => /^M[0-9]{2}/.test(c), text: "Khám Cơ Xương Khớp" },
+    { test: (c) => /^N([0-3][0-9])/.test(c), text: "Khám Thận - Tiết niệu" },
+    { test: (c) => /^N([4-9][0-9])/.test(c), text: "Khám chuyên khoa" },
+    { test: (c) => /^E[0-9]{2}/.test(c), text: "Khám Nội tiết" },
+    { test: (c) => /^F[0-9]{2}/.test(c), text: "Khám Tâm thần" },
+    { test: (c) => /^G[0-9]{2}/.test(c), text: "Khám Thần kinh" },
+    { test: (c) => /^D([5-8][0-9])/.test(c), text: "Khám Huyết học" }
+  ];
+  var ICD_STOP_GROUPS = [
+    {
+      test: (c) => /^C[0-9]{2}/.test(c) || /^D([0-4][0-9])/.test(c),
+      reason: "nhóm u bướu (C00-D48)"
+    },
+    {
+      test: (c) => /^[ST][0-9]{2}/.test(c),
+      reason: "nhóm chấn thương (S00-T98)"
+    }
+  ];
+  function extractIcdCodes(text) {
+    const matches = [
+      ...(text || "").matchAll(
+        /\(([A-Z]\d{2}(?:\.\d+)?)\)/g
+      )
+    ];
+    return matches.map(
+      (m) => m[1]
+    );
+  }
+  function classifyBenhTat(benhTatText) {
+    const trimmed = (benhTatText || "").trim();
+    if (!trimmed || norm2(trimmed) === "không có") {
+      return { type: "normal" };
+    }
+    const codes = extractIcdCodes(trimmed);
+    if (!codes.length) {
+      return {
+        type: "unknown",
+        reason: `Không nhận diện được mã ICD trong nội dung: "${trimmed}"`
+      };
+    }
+    for (const code of codes) {
+      const stopMatch = ICD_STOP_GROUPS.find(
+        (g) => g.test(code)
+      );
+      if (stopMatch) {
+        return {
+          type: "stop",
+          reason: `Mã ${code} thuộc ${stopMatch.reason} - cần bác sĩ quyết định`
+        };
+      }
+    }
+    const specialties = /* @__PURE__ */ new Set();
+    const unmatched = [];
+    for (const code of codes) {
+      const match = ICD_SPECIALTY_MAP.find(
+        (g) => g.test(code)
+      );
+      if (match) {
+        specialties.add(
+          match.text
+        );
+      } else {
+        unmatched.push(code);
+      }
+    }
+    if (unmatched.length) {
+      return {
+        type: "unknown",
+        reason: `Không nhận diện được nhóm cho mã: ${unmatched.join(", ")}`
+      };
+    }
+    return {
+      type: "specialty",
+      text: [...specialties].join(", ")
+    };
+  }
+  function parseCsv(text) {
+    const rows = [];
+    let row = [], field2 = "", inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') {
+            field2 += '"';
+            i++;
+          } else inQuotes = false;
+        } else field2 += c;
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === ",") {
+          row.push(field2);
+          field2 = "";
+        } else if (c === "\n") {
+          row.push(field2);
+          rows.push(row);
+          row = [];
+          field2 = "";
+        } else if (c !== "\r") field2 += c;
+      }
+    }
+    if (field2.length || row.length) {
+      row.push(field2);
+      rows.push(row);
+    }
+    return rows;
+  }
+  var NOT_FOUND_HEADERS = [
+    "STT",
+    "Mẫu",
+    "Họ tên",
+    "CCCD",
+    "Ngày sinh",
+    "Giới tính",
+    "Ngày khám",
+    "Trang nguồn",
+    "STT nguồn",
+    "Kết quả tra cứu",
+    "Thời điểm ghi nhận"
+  ];
+  function makeNotFoundXlsx(rows, headers = NOT_FOUND_HEADERS) {
+    const enc = new TextEncoder();
+    const xml = (value) => String(value ?? "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const cells = [headers, ...rows].map((row, r) => `<row r="${r + 1}">${row.map((v, c) => `<c r="${String.fromCharCode(65 + c)}${r + 1}" t="inlineStr" s="${r === 0 ? 1 : 0}"><is><t xml:space="preserve">${xml(v)}</t></is></c>`).join("")}</row>`).join("");
+    const files = {
+      "[Content_Types].xml": '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
+      "_rels/.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+      "xl/workbook.xml": `<workbook xmlns="${ns}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Kết quả Auto CLS" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+      "xl/_rels/workbook.xml.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
+      "xl/styles.xml": `<styleSheet xmlns="${ns}"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF155E75"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="49" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`,
+      "xl/worksheets/sheet1.xml": `<worksheet xmlns="${ns}"><dimension ref="A1:${String.fromCharCode(64 + headers.length)}${rows.length + 1}"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${[7, 8, 30, 19, 15, 12, 15, 14, 14, 30, 25].map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${headers === NOT_FOUND_HEADERS ? w : [7, 8, 30, 19, 18, 16, 15, 38, 75, 25, 40][i]}" customWidth="1"/>`).join("")}</cols><sheetData>${cells}</sheetData><autoFilter ref="A1:${String.fromCharCode(64 + headers.length)}${rows.length + 1}"/></worksheet>`
+    };
+    const crc32 = (bytes) => {
+      let crc = 4294967295;
+      for (const byte of bytes) {
+        crc ^= byte;
+        for (let i = 0; i < 8; i++) crc = crc >>> 1 ^ (crc & 1 ? 3988292384 : 0);
+      }
+      return (crc ^ 4294967295) >>> 0;
+    };
+    const parts = [], central = [];
+    let offset = 0, centralSize = 0;
+    for (const [name, content] of Object.entries(files)) {
+      const n = enc.encode(name), data = enc.encode(content), crc = crc32(data);
+      const h = new Uint8Array(30), v = new DataView(h.buffer);
+      v.setUint32(0, 67324752, true);
+      v.setUint16(4, 20, true);
+      v.setUint16(12, 33, true);
+      v.setUint32(14, crc, true);
+      v.setUint32(18, data.length, true);
+      v.setUint32(22, data.length, true);
+      v.setUint16(26, n.length, true);
+      parts.push(h, n, data);
+      const ch = new Uint8Array(46), cv = new DataView(ch.buffer);
+      cv.setUint32(0, 33639248, true);
+      cv.setUint16(4, 20, true);
+      cv.setUint16(6, 20, true);
+      cv.setUint16(14, 33, true);
+      cv.setUint32(16, crc, true);
+      cv.setUint32(20, data.length, true);
+      cv.setUint32(24, data.length, true);
+      cv.setUint16(28, n.length, true);
+      cv.setUint32(42, offset, true);
+      central.push(ch, n);
+      centralSize += ch.length + n.length;
+      offset += h.length + n.length + data.length;
+    }
+    const end = new Uint8Array(22), ev = new DataView(end.buffer);
+    ev.setUint32(0, 101010256, true);
+    ev.setUint16(8, central.length / 2, true);
+    ev.setUint16(10, central.length / 2, true);
+    ev.setUint32(12, centralSize, true);
+    ev.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, end], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  }
+  var ICD_SPECIALTY_MAPM34 = [
+    { test: (c) => /^K(0[0-9]|1[0-4])/.test(c), text: "Khám Răng" },
+    { test: (c) => /^H([0-4][0-9]|5[0-9])/.test(c), text: "Khám Mắt" },
+    { test: (c) => /^H([6-9][0-9])/.test(c), text: "Khám Tai Mũi Họng" },
+    { test: (c) => /^J[0-9]{2}/.test(c), text: "Khám Hô hấp" },
+    { test: (c) => /^I[0-9]{2}/.test(c), text: "Khám Tim mạch" },
+    { test: (c) => /^K(1[5-9]|[2-9][0-9])/.test(c), text: "Khám Tiêu hóa" },
+    { test: (c) => /^L[0-9]{2}/.test(c), text: "Khám Da liễu" },
+    { test: (c) => /^M[0-9]{2}/.test(c), text: "Khám Cơ Xương Khớp" },
+    { test: (c) => /^N([0-3][0-9])/.test(c), text: "Khám Thận - Tiết niệu" },
+    { test: (c) => /^N([4-9][0-9])/.test(c), text: "Khám chuyên khoa" },
+    { test: (c) => /^E[0-9]{2}/.test(c), text: "Khám Nội tiết" },
+    { test: (c) => /^F[0-9]{2}/.test(c), text: "Khám Tâm thần" },
+    { test: (c) => /^G[0-9]{2}/.test(c), text: "Khám Thần kinh" },
+    { test: (c) => /^D([5-8][0-9])/.test(c), text: "Khám Huyết học" }
+  ];
+  var ICD_STOP_GROUPSM34 = [
+    {
+      test: (c) => /^C[0-9]{2}/.test(c) || /^D([0-4][0-9])/.test(c),
+      reason: "nhóm u bướu (C00-D48)"
+    },
+    {
+      test: (c) => /^[ST][0-9]{2}/.test(c),
+      reason: "nhóm chấn thương (S00-T98)"
+    }
+  ];
+  function extractIcdCodesM34(text) {
+    const matches = [
+      ...(text || "").matchAll(
+        /\b([A-Z]\d{2}(?:\.[A-Z0-9]{1,4})?)\b/gi
+      )
+    ];
+    return matches.map(
+      (m) => m[1].toUpperCase()
+    );
+  }
+  function classifyBenhTatM34(benhTatText) {
+    const trimmed = (benhTatText || "").trim();
+    if (normM34(trimmed) === "khong co") {
+      return { type: "normal" };
+    }
+    const codes = extractIcdCodesM34(trimmed);
+    if (!codes.length) {
+      return {
+        type: "unknown",
+        reason: `Không nhận diện được mã ICD trong nội dung: "${trimmed}"`
+      };
+    }
+    for (const code of codes) {
+      const stopMatch = ICD_STOP_GROUPSM34.find(
+        (g) => g.test(code)
+      );
+      if (stopMatch) {
+        return {
+          type: "stop",
+          reason: `Mã ${code} thuộc ${stopMatch.reason} - cần bác sĩ quyết định`
+        };
+      }
+    }
+    const specialties = /* @__PURE__ */ new Set();
+    const unmatched = [];
+    for (const code of codes) {
+      const match = ICD_SPECIALTY_MAPM34.find(
+        (g) => g.test(code)
+      );
+      if (match) {
+        specialties.add(
+          match.text
+        );
+      } else {
+        unmatched.push(code);
+      }
+    }
+    if (unmatched.length) {
+      return {
+        type: "unknown",
+        reason: `Không nhận diện được nhóm cho mã: ${unmatched.join(", ")}`
+      };
+    }
+    return {
+      type: "specialty",
+      text: [...specialties].join(", ")
+    };
+  }
+  function normM34(v) {
+    return String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  var activeModel = "";
+  function setRulesModel(model) {
+    activeModel = model;
+  }
+  function getCurrentMedinetModel() {
+    return activeModel;
+  }
+  function norm2(v) {
+    return String(v ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  function normalizeSpecificGravity(v) {
+    return String(v ?? "").trim();
+  }
+
+  // src/data.js
+  var LAB_URL = "https://docs.google.com/spreadsheets/d/1ZN2Y7WRZUgbLQZp-fI1HQ7xlB22fVE6titx8BB1UuUk/gviz/tq?tqx=out:csv&sheet=DATA";
+  var ALIASES = {
+    cccd: [
+      "cccd",
+      "so cccd",
+      "cmnd/cccd",
+      "so cmnd/cccd",
+      "cccd/cmnd",
+      "so dinh danh",
+      "cmndcccd",
+      "socmndcccd",
+      "socccd",
+      "dinhdanhcanhan",
+      "dinh danh ca nhan",
+      "can cuoc cong dan",
+      "kskdk_dinhdanhcanhan"
+    ],
+    name: ["ho ten", "ho va ten", "ten benh nhan"],
+    dob: ["ngay sinh", "ngay thang nam sinh"],
+    sex: ["gioi tinh"],
+    date: ["ngay kham", "ngay xn", "ngay xet nghiem"],
+    visitId: ["ma phieu", "ma ho so", "so phieu", "id ho so"],
+    model: ["mau", "mau ho so", "mau ksk"],
+    sid: ["sid", "ma sid"],
+    age: ["tuoi", "nam sinh"],
+    sourceStatus: ["ket qua xu ly", "trang thai", "ket qua"],
+    health: ["phan loai suc khoe", "tinh trang suc khoe"],
+    disease: [
+      "cac benh, tat (neu co)",
+      "cac benh tat (neu co)",
+      "benh, tat",
+      "benh tat"
+    ],
+    recommendation: [
+      "de nghi (ghi ro)",
+      "de nghi ghi ro",
+      "de nghi cua bac si",
+      "de nghi"
+    ],
+    other: ["khac", "ghi chu khac"]
+  };
+  var headerKey = (v) => norm(v).replace(/^\d+[.)]\s*/, "").replace(/[:*：]+$/, "").trim();
+  function aliasKey(v) {
+    const n = headerKey(v);
+    return Object.keys(ALIASES).find((k) => ALIASES[k].includes(n)) || null;
+  }
+  function explicitModel(v) {
+    const m = norm(v).match(/(?:^|[^a-z0-9])m(2|3|4|5|6|11)(?=$|[^0-9])/);
+    return m ? "M" + m[1] : "";
+  }
+  function readTable(headers, rows, { sheet = "", order = "DMY" } = {}) {
+    const names = headers.map(aliasKey), seen = names.filter(Boolean);
+    if (new Set(seen).size !== seen.length)
+      fail("DATA_CONFLICT", "Header trùng nghĩa.");
+    if (!names.includes("cccd")) fail("EXCEL", "Không tìm thấy header CCCD.");
+    const valid = [], invalid = [];
+    rows.forEach((cells, i) => {
+      if (!cells.some((c) => present(c?.v ?? c))) return;
+      const source = { sheet, row: i + 2 };
+      try {
+        const item = { source, status: "PENDING", sourceStatus: "" };
+        headers.forEach((h, j) => {
+          const k = names[j];
+          if (!k) return;
+          const cell = cells[j];
+          const v = cell && typeof cell === "object" ? cell.v : cell;
+          const numeric2 = cell?.t === "n";
+          if (k === "cccd") item.cccd = cccd(v, { numeric: numeric2 });
+          else if (["date", "dob"].includes(k) && present(v))
+            item[k] = date(v, { order, excel: numeric2 });
+          else if (k === "model") {
+            item.model = explicitModel(v);
+            if (present(v) && !item.model)
+              fail("CONTEXT", "Mẫu trong Excel chưa được hỗ trợ.");
+          } else item[k] = String(v ?? "").trim();
+        });
+        if (!item.cccd) fail("IDENTITY", "Thiếu CCCD.");
+        valid.push(item);
+      } catch (e) {
+        invalid.push({ source, code: e.code, reason: e.message });
+      }
+    });
+    return { valid, invalid };
+  }
+  function summarize(items, invalid = []) {
+    const dates = items.map((x) => x.date).filter(Boolean).sort();
+    return {
+      rows: items.length,
+      people: new Set(items.map((x) => x.cccd)).size,
+      visits: new Set(
+        items.filter((x) => x.visitId && x.date && x.model).map(caseKey)
+      ).size,
+      models: [
+        ...new Set(items.map((x) => x.model || "Tự nhận diện từ Medinet"))
+      ],
+      from: dates[0] || "",
+      to: dates.at(-1) || "",
+      invalid: invalid.length
+    };
+  }
+  function mergeLab(rows) {
+    const out = {}, conflicts = [];
+    for (const row of rows)
+      for (const [key, v] of Object.entries(row.values)) {
+        if (!present(v)) continue;
+        if (present(out[key]) && canonical(out[key], key) !== canonical(v, key))
+          conflicts.push(key);
+        else out[key] = v;
+      }
+    if (conflicts.length)
+      fail("DATA_CONFLICT", "Các dòng CLS có chỉ số hoặc đơn vị xung đột.", {
+        columns: [...new Set(conflicts)]
+      });
+    return {
+      values: out,
+      sources: rows.map((r) => ({ row: r.row, sid: r.sid }))
+    };
+  }
+  function canonical(v, key) {
+    if (QUALITATIVE_URINE_COLUMNS.includes(key)) {
+      const p = clsParseUrine(v);
+      if (!p.invalid) return JSON.stringify(p);
+    }
+    const n = clsNumber(v);
+    return Number.isFinite(n) ? String(n) : norm(v);
+  }
+  function normalizedLabValue(column, raw, { sourceUnit = "", targetUnit: targetUnit2 = "", source = "DATA" } = {}) {
+    const original = String(raw ?? "").trim();
+    if (!original) return { raw: original, normalized: null, write: null };
+    if (column === "NIT") {
+      const n2 = norm(original).replace(/\s/g, "");
+      if (["1", "+", "duong", "duongtinh", "positive", "pos", "true"].includes(n2))
+        return { raw: original, normalized: "positive", write: "Dương tính" };
+      if (["0", "-", "am", "amtinh", "negative", "neg", "false"].includes(n2))
+        return { raw: original, normalized: "negative", write: "Âm tính" };
+      fail("DATA_CONFLICT", "Nitrit chưa nhận diện được.");
+    }
+    let n = clsNumber(original);
+    if (QUALITATIVE_URINE_COLUMNS.includes(column)) {
+      const p = clsParseUrine(original);
+      if (p.invalid || p.positive)
+        fail("DATA_CONFLICT", "Định tính chưa có mức độ rõ.");
+      if (p.grade !== void 0)
+        return {
+          raw: original,
+          normalized: p,
+          write: p.grade === 0.5 ? "+/-" : "+".repeat(p.grade)
+        };
+      n = p.value;
+    }
+    if (!Number.isFinite(n) || n < 0)
+      fail("DATA_CONFLICT", "Giá trị CLS không hợp lệ.");
+    if (column === "S.G" && source === "DATA" && !sourceUnit && /^10\d{2}$/.test(original) && n <= 1060)
+      n /= 1e3;
+    if (sourceUnit && targetUnit2 && !clsUnitMatches(sourceUnit, targetUnit2)) {
+      const u = norm(sourceUnit).replace(/\s/g, ""), t = norm(targetUnit2).replace(/\s/g, "");
+      if (column === "HCT" && u === "%" && t === "l/l") n /= 100;
+      else if (column === "HCT" && u === "l/l" && t === "%") n *= 100;
+      else if (["HGB", "MCHC"].includes(column) && u === "g/dl" && t === "g/l")
+        n *= 10;
+      else if (["HGB", "MCHC"].includes(column) && u === "g/l" && t === "g/dl")
+        n /= 10;
+      else fail("UNIT", "Đơn vị nguồn và form khác nhau; không tự đoán quy đổi.");
+    }
+    return {
+      raw: original,
+      sourceUnit,
+      targetUnit: targetUnit2,
+      normalized: n,
+      write: String(n)
+    };
+  }
+  var LabData = class {
+    constructor({
+      fetcher = globalThis.fetch,
+      order = "AUTO",
+      cache = null
+    } = {}) {
+      this.fetcher = fetcher;
+      this.cache = cache;
+      this.order = order;
+      this.index = /* @__PURE__ */ new Map();
+      this.loadedAt = 0;
+      this.hash = "";
+      this.rows = [];
+    }
+    async load({ force = false, signal } = {}) {
+      check(signal);
+      this.bindCache?.();
+      if (!force && Date.now() - this.loadedAt < 12e4) return this;
+      if (!force && this.cache) {
+        try {
+          const c = await this.cache.get();
+          if (c && c.order === this.order && Date.now() - c.loadedAt >= 0 && Date.now() - c.loadedAt < 12e4 && c.index instanceof Map && c.byId instanceof Map && c.byName instanceof Map && Array.isArray(c.rows)) {
+            Object.assign(this, {
+              loadedAt: c.loadedAt,
+              hash: c.hash,
+              rows: c.rows,
+              index: c.index,
+              byId: c.byId,
+              byName: c.byName
+            });
+            return this;
+          }
+        } catch {
+          this.cacheNote = "Cache qua reload chưa khả dụng; nguồn vẫn được tải và kiểm tra.";
+        }
+      }
+      const stop = AbortSignal.any([
+        ...signal ? [signal] : [],
+        AbortSignal.timeout(6e4)
+      ]);
+      let response;
+      try {
+        response = await this.fetcher(LAB_URL, {
+          signal: stop,
+          credentials: "omit"
+        });
+      } catch (e) {
+        check(signal);
+        throw new Fault(
+          "NETWORK",
+          "Không tải được nguồn CLS; không coi là không có XN."
+        );
+      }
+      if (!response.ok) fail("NETWORK", "Nguồn CLS trả HTTP " + response.status);
+      const csv = await response.text();
+      check(signal);
+      this.fromCsv(csv);
+      this.hash = await digest(this.rows);
+      if (this.cache)
+        try {
+          await this.cache.put({
+            order: this.order,
+            loadedAt: this.loadedAt,
+            hash: this.hash,
+            rows: this.rows,
+            index: this.index,
+            byId: this.byId,
+            byName: this.byName
+          });
+        } catch {
+          this.cacheNote = "Không lưu được cache qua reload.";
+        }
+      return this;
+    }
+    fromCsv(csv) {
+      if (csv.length > 25e6) fail("DATA", "Nguồn CLS quá lớn.");
+      const table = parseCsv(csv);
+      const headers = table.shift() || [];
+      if (new Set(headers.map(norm)).size !== headers.length)
+        fail("DATA", "Nguồn CLS có header trùng.");
+      const keys = headers.map((h) => aliasKey(h));
+      for (const k of ["name", "date", "sid"])
+        if (!keys.includes(k)) fail("DATA", "Nguồn CLS thiếu cột " + k);
+      this.index = /* @__PURE__ */ new Map();
+      this.byId = /* @__PURE__ */ new Map();
+      this.byName = /* @__PURE__ */ new Map();
+      this.rows = [];
+      table.forEach((cells, i) => {
+        if (!cells.some(present)) return;
+        const r = { row: i + 2, values: {} };
+        headers.forEach((h, j) => {
+          const v = cells[j] ?? "";
+          const k = keys[j];
+          if (k) r[k] = String(v).trim();
+          else {
+            const base = h.trim();
+            const candidates = [
+              ...CAN_LAM_SANG_FIELD_MAP.map((f) => f.column),
+              "NIT",
+              ...CAN_LAM_SANG_FIELD_MAP.map((f) => f.column + "_UNIT")
+            ];
+            const canonical2 = candidates.find((c) => norm(c) === norm(base)) || base;
+            r.values[canonical2] = v;
+          }
+        });
+        try {
+          r.date = date(r.date, { order: this.order });
+          if (r.cccd) r.cccd = cccd(r.cccd);
+          if (r.dob) r.dob = date(r.dob, { order: this.order });
+        } catch (e) {
+          r.error = e.code;
+        }
+        const key = norm(r.name) + "|" + r.date;
+        const arr = this.index.get(key) || [];
+        arr.push(r);
+        this.index.set(key, arr);
+        if (r.cccd) {
+          const a = this.byId.get(r.cccd) || [];
+          a.push(r);
+          this.byId.set(r.cccd, a);
+        }
+        const named = this.byName.get(norm(r.name)) || [];
+        named.push(r);
+        this.byName.set(norm(r.name), named);
+        this.rows.push(r);
+      });
+      this.loadedAt = Date.now();
+      this.hash = "";
+      return this;
+    }
+    async clearCache() {
+      this.bindCache?.();
+      this.loadedAt = 0;
+      this.rows = [];
+      this.index = /* @__PURE__ */ new Map();
+      this.byId = /* @__PURE__ */ new Map();
+      this.byName = /* @__PURE__ */ new Map();
+      this.hash = "";
+      if (this.cache) await this.cache.clear();
+    }
+    async match(c, { signal } = {}) {
+      await this.load({ signal });
+      if (!this.hash) this.hash = await digest(this.rows);
+      const key = norm(c.name) + "|" + date(c.date);
+      const exact = (this.byId?.get(c.cccd) || []).filter(
+        (r) => r.date === date(c.date)
+      );
+      if (exact.some((r) => norm(r.name) !== norm(c.name)))
+        fail("DATA_CONFLICT", "CCCD nguồn CLS có tên mâu thuẫn.");
+      let rows = this.index.get(key) || [];
+      if (!rows.length && [
+        ...this.byName?.get(norm(c.name)) || [],
+        ...this.byId?.get(c.cccd) || []
+      ].some(
+        (r) => r.error && (norm(r.name) === norm(c.name) || r.cccd === c.cccd)
+      ))
+        fail("DATA_CONFLICT", "Ngày hoặc định danh nguồn XN chưa được xác minh.");
+      rows = rows.filter((r) => !r.cccd || r.cccd === c.cccd);
+      if (!rows.length)
+        return { status: "NO_LAB", values: {}, sources: [], hash: this.hash };
+      const sex = (v) => ({ nam: "M", m: "M", male: "M", nu: "F", f: "F", female: "F" })[norm(v)] || "";
+      for (const r of rows) {
+        if (r.error) fail("DATA_CONFLICT", "Dòng nguồn CLS không hợp lệ.");
+        if (r.sex && (!sex(c.sex) || sex(r.sex) !== sex(c.sex)))
+          fail("DATA_CONFLICT", "Giới tính nguồn CLS mâu thuẫn.");
+        if (r.dob && (!c.dob || date(r.dob) !== date(c.dob)))
+          fail("DATA_CONFLICT", "Ngày sinh nguồn CLS mâu thuẫn.");
+        if (r.age) {
+          const age = Number(r.age);
+          if (!Number.isInteger(age) || !c.dob)
+            fail("DATA_CONFLICT", "Chưa xác minh tuổi/năm sinh nguồn.");
+          const by = Number(c.dob.slice(0, 4)), ey = Number(c.date.slice(0, 4));
+          const exact2 = ey - by - (c.date.slice(5) < c.dob.slice(5) ? 1 : 0);
+          if (age >= 1900 ? age !== by : Math.abs(age - exact2) > 1)
+            fail("DATA_CONFLICT", "Tuổi/năm sinh nguồn mâu thuẫn.");
+        }
+        if (!r.cccd && (!r.sex || !r.dob && !r.age || !c.sex || !c.dob))
+          fail(
+            "DATA_CONFLICT",
+            "Nguồn không có CCCD: thiếu tổ hợp tên/ngày/giới/ngày sinh hoặc tuổi."
+          );
+        if (/^\d{6}-/.test(r.sid || "")) {
+          const [y, m, d] = c.date.split("-");
+          if (!r.sid.startsWith(d + m + y.slice(2) + "-"))
+            fail("DATA_CONFLICT", "SID cũ không khớp ngày khám.");
+        }
+      }
+      const merged = mergeLab(rows);
+      merged.values["Giới tính"] = c.sex || "";
+      if (c.dob) {
+        const birth = Number(c.dob.slice(0, 4));
+        merged.values["Tuổi thực"] = Number(c.date.slice(0, 4)) - birth - (c.date.slice(5) < c.dob.slice(5) ? 1 : 0);
+      }
+      return { status: "OK", ...merged, hash: this.hash };
+    }
+  };
+  async function readXlsx(file, { order = "DMY", DOM = globalThis.DOMParser } = {}) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (bytes.length > 2e7 || bytes.length < 22)
+      fail("EXCEL", "File XLSX rỗng hoặc quá 20 MB.");
+    const view = new DataView(bytes.buffer);
+    let end = bytes.length - 22;
+    while (end >= Math.max(0, bytes.length - 65557) && view.getUint32(end, true) !== 101010256)
+      end--;
+    if (end < Math.max(0, bytes.length - 65557))
+      fail("EXCEL", "File phải ở định dạng .xlsx.");
+    const count = view.getUint16(end + 10, true);
+    if (count > 5e3) fail("EXCEL", "Quá nhiều mục ZIP.");
+    const entries = /* @__PURE__ */ new Map();
+    let pos = view.getUint32(end + 16, true), expanded = 0;
+    for (let i = 0; i < count; i++) {
+      if (pos + 46 > bytes.length || view.getUint32(pos, true) !== 33639248)
+        fail("EXCEL", "ZIP không hợp lệ.");
+      const nl = view.getUint16(pos + 28, true), ex = view.getUint16(pos + 30, true), co = view.getUint16(pos + 32, true);
+      const name = new TextDecoder().decode(bytes.slice(pos + 46, pos + 46 + nl));
+      const size = view.getUint32(pos + 24, true);
+      expanded += size;
+      if (expanded > 6e7 || size > 3e7)
+        fail("EXCEL", "Nội dung XLSX giải nén quá lớn.");
+      entries.set(name, {
+        method: view.getUint16(pos + 10, true),
+        size: view.getUint32(pos + 20, true),
+        offset: view.getUint32(pos + 42, true),
+        flags: view.getUint16(pos + 8, true)
+      });
+      pos += 46 + nl + ex + co;
+    }
+    const read2 = async (name) => {
+      const e = entries.get(name);
+      if (!e) return null;
+      if (e.flags & 1) fail("EXCEL", "File có mật khẩu.");
+      if (e.offset + 30 > bytes.length) fail("EXCEL", "ZIP hỏng.");
+      const at = e.offset + 30 + view.getUint16(e.offset + 26, true) + view.getUint16(e.offset + 28, true);
+      let data = bytes.slice(at, at + e.size);
+      if (e.method === 8) {
+        const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw")).getReader();
+        let total = 0;
+        const chunks = [];
+        for (; ; ) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.length;
+          if (total > 3e7) {
+            await reader.cancel();
+            fail("EXCEL", "Giải nén vượt giới hạn.");
+          }
+          chunks.push(value);
+        }
+        data = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          data.set(chunk, offset);
+          offset += chunk.length;
+        }
+      } else if (e.method !== 0) fail("EXCEL", "Không hỗ trợ kiểu nén này.");
+      const xml = new TextDecoder().decode(data);
+      if (/<!DOCTYPE|<!ENTITY/i.test(xml))
+        fail("EXCEL", "XML có thực thể không được hỗ trợ.");
+      const doc = new DOM().parseFromString(xml, "application/xml");
+      if (doc.querySelector("parsererror")) fail("EXCEL", "XML không hợp lệ.");
+      return doc;
+    };
+    const wb = await read2("xl/workbook.xml"), rels = await read2("xl/_rels/workbook.xml.rels");
+    if (!wb || !rels) fail("EXCEL", "Không tìm thấy workbook.");
+    const ss = await read2("xl/sharedStrings.xml");
+    const text = (node) => [...node.getElementsByTagNameNS("*", "t")].map((t) => t.textContent).join("");
+    const strings = ss ? [...ss.getElementsByTagNameNS("*", "si")].map(text) : [];
+    const valid = [], invalid = [];
+    for (const sheet of wb.getElementsByTagNameNS("*", "sheet")) {
+      const id = sheet.getAttributeNS(
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "id"
+      );
+      const rel = [...rels.getElementsByTagNameNS("*", "Relationship")].find(
+        (r) => r.getAttribute("Id") === id
+      );
+      if (!rel || rel.getAttribute("TargetMode") === "External")
+        fail("EXCEL", "Sheet liên kết ngoài không hỗ trợ.");
+      const target = rel.getAttribute("Target");
+      if (!target || target.includes(".."))
+        fail("EXCEL", "Đường dẫn sheet không hợp lệ.");
+      const doc = await read2(
+        target.startsWith("/") ? target.slice(1) : "xl/" + target.replace(/^\.\//, "")
+      );
+      if (!doc) fail("EXCEL", "Không đọc được sheet.");
+      const rows = /* @__PURE__ */ new Map();
+      for (const cell of doc.getElementsByTagNameNS("*", "c")) {
+        const ref = cell.getAttribute("r") || "";
+        const m = ref.match(/^([A-Z]+)(\d+)$/);
+        if (!m) continue;
+        let col = 0;
+        for (const ch of m[1]) col = col * 26 + ch.charCodeAt(0) - 64;
+        if (col > 256) continue;
+        const row = Number(m[2]);
+        if (row > 2e5) fail("EXCEL", "Quá nhiều dòng.");
+        const type = cell.getAttribute("t") || "n";
+        const raw = cell.getElementsByTagNameNS("*", "v")[0]?.textContent ?? "";
+        const v = type === "s" ? strings[Number(raw)] ?? "" : type === "inlineStr" ? text(cell) : type === "n" && raw !== "" ? Number(raw) : raw;
+        const arr = rows.get(row) || [];
+        arr[col - 1] = { v, t: type };
+        rows.set(row, arr);
+      }
+      const sorted = [...rows].sort((a, b) => a[0] - b[0]);
+      const h = sorted.slice(0, 12).find(([, r]) => r.some((c) => aliasKey(c?.v) === "cccd"));
+      if (!h) {
+        invalid.push({
+          source: { sheet: sheet.getAttribute("name") },
+          reason: "Sheet không có header CCCD."
+        });
+        continue;
+      }
+      for (const [row, cells] of sorted.filter(([i]) => i > h[0])) {
+        const r = readTable(
+          h[1].map((c) => c?.v ?? ""),
+          [cells],
+          { sheet: sheet.getAttribute("name"), order }
+        );
+        for (const item of [...r.valid, ...r.invalid]) item.source.row = row;
+        valid.push(...r.valid);
+        invalid.push(...r.invalid);
+      }
+    }
+    return { valid, invalid, summary: summarize(valid, invalid) };
+  }
+  function logWorkbook(logs) {
+    const heads = [
+      "Mã phiên",
+      "Tác vụ",
+      "Mẫu",
+      "Mã phiếu",
+      "CCCD",
+      "Ngày khám",
+      "Bước",
+      "Trạng thái",
+      "Lý do",
+      "SID nguồn",
+      "Dòng nguồn",
+      "Bắt đầu",
+      "Kết thúc",
+      "Số lần thử",
+      "Bằng chứng"
+    ];
+    return makeNotFoundXlsx(
+      logs.map((r) => [
+        r.runId,
+        r.task,
+        r.case?.model,
+        r.case?.visitId,
+        r.case?.cccd || r.lookup?.cccd,
+        r.case?.date || r.lookup?.date,
+        r.step,
+        r.status,
+        r.reason,
+        r.sources?.map((s) => s.sid).join(" + "),
+        r.sources?.map((s) => s.row).join(", "),
+        r.startedAt,
+        r.endedAt,
+        r.attempt,
+        JSON.stringify(r.evidence || {})
+      ]),
+      heads
+    );
+  }
+
+  // src/cache.js
+  var SourceCache = class {
+    constructor(indexedDB, key) {
+      this.indexedDB = indexedDB;
+      this.key = key;
+    }
+    async open() {
+      if (!this.indexedDB || !this.key) return null;
+      return new Promise((resolve2, reject) => {
+        let expired = false;
+        const request = this.indexedDB.open("tro-ly-medinet-source-cache-v1", 1);
+        const timer = setTimeout(() => {
+          expired = true;
+          reject(new Error("Cache timeout"));
+        }, 4e3);
+        const error = () => {
+          clearTimeout(timer);
+          reject(request.error || new Error("Cache blocked"));
+        };
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains("snapshots"))
+            request.result.createObjectStore("snapshots");
+        };
+        request.onsuccess = () => {
+          clearTimeout(timer);
+          if (expired) request.result.close();
+          else resolve2(request.result);
+        };
+        request.onerror = error;
+        request.onblocked = () => {
+          expired = true;
+          error();
+        };
+      });
+    }
+    async transaction(mode, action) {
+      const db = await this.open();
+      if (!db) return null;
+      try {
+        return await new Promise((resolve2, reject) => {
+          const tx = db.transaction("snapshots", mode);
+          let result = null;
+          const timer = setTimeout(() => {
+            try {
+              tx.abort();
+            } catch {
+            }
+            reject(new Error("Cache transaction timeout"));
+          }, 4e3);
+          const done = (fn) => {
+            clearTimeout(timer);
+            fn();
+          };
+          const request = action(tx.objectStore("snapshots"));
+          request.onsuccess = () => result = request.result;
+          tx.oncomplete = () => done(() => resolve2(result ?? null));
+          tx.onerror = () => done(() => reject(tx.error));
+          tx.onabort = () => done(() => reject(tx.error || new Error("Cache aborted")));
+        });
+      } finally {
+        db.close();
+      }
+    }
+    get() {
+      return this.transaction("readonly", (store) => store.get(this.key));
+    }
+    put(value) {
+      return this.transaction("readwrite", (store) => store.put(value, this.key));
+    }
+    clear() {
+      return this.transaction("readwrite", (store) => store.delete(this.key));
+    }
+  };
+
+  // src/context.js
+  var LISTS = {
+    M2: "KSKDK_DanhSach_KSK_M12",
+    M3: "KSKDK_DanhSach_KSK_M13",
+    M4: "KSKDK_DanhSach_KSK_NguoiCaoTuoi_Report",
+    M5: "KSKDK_DanhSach_DinhKyLaiXe",
+    M6: "KSKDK_DanhSach_DinhKy_LaiXeOto",
+    M11: "KSKDK_DanhSach_KSK_M11"
+  };
+  var M11_URL = "https://quanlyskcd.medinet.org.vn/app/main/dynamicreport/report/viewer-utility/KSKDK_DanhSach_KSK_M11";
+  function visible(el) {
+    if (!el?.isConnected || el.closest(
+      '[hidden],[aria-hidden="true"],.dx-state-invisible,#tro-ly-medinet'
+    ))
+      return false;
+    for (let p = el; p && p.nodeType === 1; p = p.parentElement) {
+      const s = p.ownerDocument.defaultView.getComputedStyle(p);
+      if (s.display === "none" || s.visibility === "hidden" || s.visibility === "collapse")
+        return false;
+    }
+    return !!el.getClientRects().length;
+  }
+  function all(root, selector) {
+    return [...root.querySelectorAll(selector)].filter(visible);
+  }
+  function unique(items, label) {
+    const a = [...new Set(items)];
+    if (a.length !== 1)
+      fail("UI_CHANGED", `${label}: cần đúng một phần tử, tìm thấy ${a.length}.`);
+    return a[0];
+  }
+  function activeRoot(doc) {
+    const roots = all(doc, 'main,[role="main"],.content,.page-content').filter(
+      (r) => all(r, "form,table,.dx-datagrid,h2.hidden-web-title").length
+    );
+    const minimal = roots.filter(
+      (r) => !roots.some((x) => x !== r && r.contains(x))
+    );
+    if (minimal.length === 1) return minimal[0];
+    const forms = all(doc, "form");
+    return unique(forms, "Vùng form đang hoạt động");
+  }
+  function routeInfo(url) {
+    const u = new URL(url), path = decodeURIComponent(u.pathname).replace(/\/$/, "");
+    const matches = Object.entries(LISTS).filter(
+      ([, marker]) => path.endsWith("/" + marker)
+    );
+    if (matches.length === 1)
+      return { model: matches[0][0], kind: "list", report: matches[0][1] };
+    if (path.includes("/viewer-utility/"))
+      return { model: "", kind: "unknown", report: "" };
+    const models = [];
+    if (/kskdk_NguoiCaoTuoi|KNCT_|mauphieunct/i.test(path)) models.push("M4");
+    if (/(?:^|[_/])M11(?:[_/]|$)/i.test(path)) models.push("M11");
+    return {
+      model: models.length === 1 ? models[0] : "",
+      kind: "detail",
+      report: ""
+    };
+  }
+  function modelFromHeading(t) {
+    const n = norm(t);
+    const set = /* @__PURE__ */ new Set();
+    for (const m of n.matchAll(
+      /(?:^|[^a-z0-9])(?:mau\s*)?m(\d{1,2})(?=$|[^0-9])/g
+    ))
+      set.add("M" + m[1]);
+    if (n.includes("duoi 18 tuoi")) set.add("M2");
+    if (n.includes("nguoi cao tuoi")) set.add("M4");
+    if (/18\s*-\s*59/.test(n)) set.add("M3");
+    return [...set];
+  }
+  var VALUE_LABELS = "label,b,strong,span,p,div,h3,h4,h5,.control-label,.dx-field-item-label-text,dt,th";
+  function readLabel(root, key, labelNodes = null) {
+    const labels = (labelNodes || all(root, VALUE_LABELS)).filter(
+      (el) => aliasKey(el.textContent) === key
+    );
+    const values = [];
+    for (const l of labels) {
+      const id = l.getAttribute("for");
+      const linked = id ? l.ownerDocument.getElementById(id) : null;
+      if (linked && root.contains(linked) && visible(linked)) {
+        values.push("value" in linked ? linked.value : linked.textContent);
+        continue;
+      }
+      if (l.tagName === "DT") {
+        const dd = l.nextElementSibling;
+        if (dd?.tagName === "DD" && visible(dd)) values.push(dd.textContent);
+        continue;
+      }
+      let p = l.parentElement;
+      for (let i = 0; i < 4 && p && root.contains(p); i++, p = p.parentElement) {
+        const c = all(
+          p,
+          'input:not([type="file"]),textarea,.ql-editor,dd,.form-control-static,.dx-field-value'
+        );
+        if (c.length === 1) {
+          values.push("value" in c[0] ? c[0].value : c[0].textContent);
+          break;
+        }
+        if (c.length > 1) break;
+        const siblings = [...p.children].filter(
+          (x) => x !== l && !x.contains(l) && visible(x) && !x.querySelector("label,b,strong")
+        );
+        if (siblings.length === 1) {
+          values.push(siblings[0].textContent);
+          break;
+        }
+      }
+    }
+    const distinct = [...new Set(values.map((v) => String(v ?? "").trim()))];
+    if (distinct.length > 1)
+      fail("IDENTITY", "Nhãn " + key + " có giá trị mâu thuẫn.");
+    return distinct.length ? distinct[0] : null;
+  }
+  function readIdentity(root, url, model) {
+    const u = new URL(url);
+    const c = { model };
+    const labelNodes = all(root, VALUE_LABELS);
+    for (const key of ["cccd", "name", "dob", "sex", "date", "visitId"]) {
+      const v = readLabel(root, key, labelNodes);
+      if (v !== null) c[key] = v;
+    }
+    const ids = ["phieukhamId", "phieuKhamId", "phieukhamid"].map((k) => u.searchParams.get(k)).filter(Boolean);
+    const routeId = [...new Set(ids)];
+    if (routeId.length > 1) fail("IDENTITY", "ID phiếu trong URL mâu thuẫn.");
+    if (routeId[0]) {
+      c.routeId = routeId[0];
+      if (!c.visitId) c.visitId = c.routeId;
+    }
+    if (!c.visitId || !c.name || !c.date || !c.cccd)
+      fail(
+        "IDENTITY",
+        "Chưa đọc đủ mã phiếu, họ tên, CCCD và ngày khám trong vùng hồ sơ."
+      );
+    c.cccd = cccd(c.cccd);
+    c.date = date(c.date);
+    if (c.dob) c.dob = date(c.dob);
+    return c;
+  }
+  function principal(win) {
+    const s = win.abp?.session;
+    return s?.userId != null ? `${s.tenantId ?? ""}:${s.userId}` : null;
+  }
+  function resolve(doc, url, { session = null, expected = null, requireIdentity = false } = {}) {
+    if (all(doc, 'input[type="password"]').length)
+      fail("AUTH", "Mất đăng nhập; phiên đã tạm dừng.");
+    const root = activeRoot(doc);
+    const route = routeInfo(url);
+    const headings = all(
+      root,
+      "h1,h2,h3,.hidden-web-title,.page-title,.card-title,legend"
+    ).map((h) => norm(h.textContent));
+    const candidates = new Set(route.model ? [route.model] : []);
+    for (const h of headings)
+      for (const m of modelFromHeading(h)) {
+        const reportAlias = { M12: "M2", M13: "M3" };
+        const explicitTemplate = /\bmau\s*m\d+\b/.test(h);
+        candidates.add(
+          route.kind === "list" && !explicitTemplate && reportAlias[m] ? reportAlias[m] : m
+        );
+      }
+    if (candidates.size > 1)
+      fail("CONTEXT", "URL và tiêu đề không thống nhất về mẫu.");
+    let model = [...candidates][0] || "";
+    if (!model && session?.case && session.origin === new URL(url).origin && (!session.owner || session.owner === principal(doc.defaultView)) && (!session.updatedAt || Date.now() - session.updatedAt < 8 * 36e5)) {
+      const now = readIdentity(root, url, session.case.model);
+      if (sameCase(session.case, now)) model = session.case.model;
+    }
+    if (model && !Object.keys(LISTS).includes(model))
+      fail("CONTEXT", "Mẫu hồ sơ này chưa có triển khai trong bốn nguồn.");
+    if (!model)
+      fail(
+        "CONTEXT",
+        "Chưa đủ bằng chứng xác định mẫu; không dùng mẫu mặc định."
+      );
+    const labels = all(
+      root,
+      "label,b,strong,.control-label,.dx-field-item-label-text"
+    ).map((l) => headerKey(l.textContent));
+    let page = route.kind === "list" ? "list" : "";
+    if (!page) {
+      const primary = all(root, "h1,h2,.hidden-web-title,.page-title").map(
+        (h) => norm(h.textContent)
+      );
+      const titles = primary.length ? primary : headings;
+      const cls = titles.some((h) => /can lam sang|ket qua xet nghiem/.test(h)) && labels.some((l) => /so luong hc|huyet sac to/.test(l));
+      const conclusion = titles.some((h) => h.includes("ket luan")) && labels.some((l) => aliasKey(l) === "recommendation");
+      if (cls && conclusion)
+        fail("CONTEXT", "Hai vùng CLS và Kết luận cùng hoạt động.");
+      if (cls) page = "cls";
+      else if (conclusion) page = "conclusion";
+      else if (headings.some((h) => h.includes("tien su"))) page = "history";
+      else if (headings.some((h) => h.includes("suc khoe tam than")))
+        page = "mental";
+      else if (headings.some((h) => h.includes("hoi benh va kham lam sang")))
+        page = "questions";
+      else if (headings.some((h) => /thong tin kham|kham lam sang/.test(h)))
+        page = "clinical";
+      else if (headings.some((h) => h.includes("hanh chinh"))) page = "admin";
+    }
+    if (!page) fail("CONTEXT", "Trang/tab chưa thuộc adapter đã biết.");
+    const context = { root, model, page, route, url };
+    if (page !== "list" && (requireIdentity || expected)) {
+      context.case = readIdentity(root, url, model);
+      if (expected && !sameCase(expected, context.case))
+        fail("IDENTITY", "Hồ sơ hiện tại không khớp lượt khám đang xử lý.");
+    }
+    return context;
+  }
+  function listMeta(root) {
+    const nodes = all(
+      root,
+      '.dx-pager,.pagination,.dx-datagrid-nodata,[role="status"],span,p,div'
+    ).filter(
+      (n) => n.textContent.length < 200 && (!n.matches("div") || !n.children.length)
+    );
+    let total = null, current = null, pages = null;
+    for (const n of nodes) {
+      const t = n.textContent;
+      let m = t.match(/Có\s+(\d+)\s+kết quả/i);
+      if (m) total = Number(m[1]);
+      m = t.match(/Trang\s+(\d+)\s+trên\s+(\d+)(?:\s*\((\d+)\s+dòng\))?/i);
+      if (m) {
+        current = Number(m[1]);
+        pages = Number(m[2]);
+        if (m[3]) total = Number(m[3]);
+      }
+    }
+    return { total, current, pages };
+  }
+  function gridInstance(root) {
+    const el = all(root, ".dx-datagrid")[0];
+    if (!el) return null;
+    const w = el.ownerDocument.defaultView;
+    try {
+      return w.DevExpress?.ui?.dxDataGrid?.getInstance(el) || w.jQuery?.(el)?.dxDataGrid?.("instance") || null;
+    } catch {
+      return null;
+    }
+  }
+  function listRows(context) {
+    const { root, model } = context;
+    if (context.page !== "list") fail("CONTEXT", "Chưa ở danh sách.");
+    if (all(
+      root,
+      '.dx-loadpanel,.loading-overlay,.ngx-spinner-overlay,[aria-busy="true"]'
+    ).length)
+      fail("TIMEOUT", "Bảng đang tải.");
+    const dx = all(root, ".dx-datagrid").filter(
+      (g) => all(g, ".dx-datagrid-headers td,.dx-datagrid-headers th").some(
+        (h) => aliasKey(h.textContent) === "cccd"
+      )
+    );
+    const plain = all(root, "table").filter(
+      (t) => !dx.some((g) => g.contains(t)) && all(t, "thead th,thead td").some(
+        (h) => aliasKey(h.textContent) === "cccd"
+      )
+    );
+    const table = unique([...dx, ...plain], "Bảng danh sách có header CCCD");
+    const isGrid = table.matches(".dx-datagrid");
+    const headers = all(
+      table,
+      isGrid ? ".dx-datagrid-headers tr:last-child td,.dx-datagrid-headers tr:last-child th" : "thead tr:last-child th,thead tr:last-child td"
+    ).map((h) => aliasKey(h.textContent));
+    for (const key of ["cccd", "name", "date", "visitId"])
+      if (headers.filter((k) => k === key).length !== 1)
+        fail("UI_CHANGED", "Danh sách thiếu hoặc trùng header " + key);
+    const rows = all(
+      table,
+      isGrid ? '.dx-datagrid-rowsview tr.dx-data-row,.dx-datagrid-rowsview [role="row"]' : "tbody tr"
+    ).filter((r) => r.querySelector('td,[role="gridcell"]'));
+    if (!rows.length) {
+      const meta = listMeta(root);
+      const empty = all(table, ".dx-datagrid-nodata").some(
+        (n) => /khong co du lieu|no data/i.test(norm(n.textContent))
+      );
+      let loadedZero = false;
+      const grid = gridInstance(root);
+      try {
+        const ds = grid?.getDataSource?.();
+        loadedZero = ds?.isLoaded?.() === true && ds?.isLoading?.() === false && ds?.totalCount?.() === 0;
+      } catch {
+      }
+      if (meta.total !== 0 && !empty && !loadedZero)
+        fail("TIMEOUT", "Chưa có bằng chứng bảng rỗng thật.");
+    }
+    return rows.map((row) => {
+      const cells = [
+        ...row.querySelectorAll(':scope > td,:scope > [role="gridcell"]')
+      ];
+      const c = { model };
+      headers.forEach((key, i) => {
+        if (key) c[key] = cells[i]?.textContent.trim() || "";
+      });
+      try {
+        c.cccd = cccd(c.cccd);
+        c.date = date(c.date);
+        if (c.dob) c.dob = date(c.dob);
+        if (!c.visitId || !c.name) fail("IDENTITY", "Thiếu mã phiếu/họ tên.");
+        return { row, case: c };
+      } catch (e) {
+        return { row, error: e };
+      }
+    });
+  }
+
+  // src/form.js
+  var CONTROL = 'input:not([type="file"]):not([type="hidden"]),textarea,[contenteditable="true"]';
+  var writable = (el) => visible(el) && !el.disabled && !el.readOnly && el.getAttribute("aria-disabled") !== "true" && !el.closest('.dx-state-disabled,[aria-disabled="true"]') && el.type !== "file";
+  var read = (el) => "value" in el ? String(el.value ?? "") : el.textContent || "";
+  var labelKey = (value) => headerKey(value).replace(/\s*\(\s*/g, "(").replace(/\s*\)/g, ")");
+  function field(root, names, { optional = false } = {}) {
+    const wanted = names.map(labelKey), found = /* @__PURE__ */ new Set();
+    const controls = all(root, CONTROL).filter(writable);
+    const named = controls.filter(
+      (c) => wanted.includes(labelKey(c.getAttribute("aria-label") || "")) || wanted.includes(labelKey(c.name || "")) || wanted.includes(labelKey(c.id || ""))
+    );
+    if (named.length === 1) return named[0];
+    if (named.length > 1) fail("UI_CHANGED", "Nhiều control cùng tên.");
+    const labels = all(
+      root,
+      "label,b,strong,span,.control-label,.dx-field-item-label-text"
+    ).filter(
+      (l) => wanted.includes(
+        labelKey(l.textContent).replace(/\s*\([^)]*\)\s*$/, "")
+      ) || wanted.includes(labelKey(l.textContent))
+    );
+    for (const label of labels) {
+      const id = label.getAttribute("for");
+      const linked = id ? label.ownerDocument.getElementById(id) : null;
+      if (linked && root.contains(linked)) {
+        if (writable(linked) && linked.matches(CONTROL)) {
+          found.add(linked);
+          continue;
+        }
+        if (visible(linked)) {
+          const c = all(linked, CONTROL).filter(writable);
+          if (c.length === 1) {
+            found.add(c[0]);
+            continue;
+          }
+        }
+      }
+      let p = label.parentElement;
+      for (let d = 0; d < 5 && p && root.contains(p); d++, p = p.parentElement) {
+        const c = all(p, CONTROL).filter(writable);
+        if (c.length === 1) {
+          found.add(c[0]);
+          break;
+        }
+        if (c.length > 1) break;
+      }
+    }
+    if (!found.size && optional) return null;
+    return unique([...found], "Trường " + names[0]);
+  }
+  function widget(el) {
+    const win = el.ownerDocument.defaultView;
+    const kinds = [
+      [".dx-numberbox,dx-number-box,hnumberbox", "dxNumberBox"],
+      [".dx-textarea,dx-text-area", "dxTextArea"],
+      [".dx-textbox,dx-text-box", "dxTextBox"],
+      [".dx-selectbox,dx-select-box", "dxSelectBox"]
+    ];
+    for (const [sel, name] of kinds) {
+      const host = el.closest(sel);
+      if (!host) continue;
+      try {
+        const pub = win.DevExpress?.ui?.[name]?.getInstance(host);
+        if (pub) return pub;
+        const jq = win.jQuery;
+        if (jq && typeof jq(host)[name] === "function")
+          return jq(host)[name]("instance");
+      } catch {
+      }
+    }
+    return null;
+  }
+  var numeric = (el) => el.type === "number" || el.getAttribute("role") === "spinbutton" || !!el.closest(".dx-numberbox,dx-number-box,hnumberbox");
+  function equivalent(a, b, column) {
+    if (QUALITATIVE_URINE_COLUMNS.includes(column)) {
+      const x2 = clsParseUrine(a), y2 = clsParseUrine(b);
+      return !x2.invalid && !y2.invalid && JSON.stringify(x2) === JSON.stringify(y2);
+    }
+    const x = clsNumber(a), y = clsNumber(b);
+    return Number.isFinite(x) && Number.isFinite(y) ? Math.abs(x - y) < 1e-7 : String(a).trim() === String(b).trim();
+  }
+  async function write(find, value, { guard, signal, column = "" } = {}) {
+    check(signal);
+    guard();
+    let el = find();
+    if (!writable(el)) fail("UI_CHANGED", "Trường không thể nhập.");
+    const inst = widget(el);
+    const target = numeric(el) ? clsNumber(value) : String(value);
+    if (numeric(el) && !Number.isFinite(target))
+      fail("WIDGET", "Ô số không thể nhận định tính; cần kiểm tra adapter.");
+    if (inst) {
+      inst.option("value", target);
+      if (!equivalent(inst.option("value"), target, column))
+        fail("COMMIT", "Widget không nhận giá trị.");
+    } else {
+      const win = el.ownerDocument.defaultView;
+      if (el.matches('[contenteditable="true"]')) el.textContent = String(value);
+      else {
+        const proto = el.tagName === "TEXTAREA" ? win.HTMLTextAreaElement.prototype : el.tagName === "INPUT" ? win.HTMLInputElement.prototype : null;
+        if (!proto) fail("WIDGET", "Loại control chưa hỗ trợ.");
+        Object.getOwnPropertyDescriptor(proto, "value").set.call(
+          el,
+          String(value)
+        );
+      }
+      el.dispatchEvent(new win.Event("input", { bubbles: true }));
+      el.dispatchEvent(new win.Event("change", { bubbles: true }));
+      el.dispatchEvent(new win.FocusEvent("blur", { bubbles: true }));
+    }
+    await wait(
+      () => {
+        guard();
+        el = find();
+        const w = widget(el);
+        return equivalent(read(el), value, column) && (!w || equivalent(w.option("value"), target, column));
+      },
+      { timeout: 5e3, signal, label: "giá trị commit" }
+    );
+    return {
+      value: String(value),
+      widget: inst ? "public API" : "DOM events; requires persisted readback"
+    };
+  }
+  var selected = (el) => el?.getAttribute("aria-checked") === "true" || el?.getAttribute("aria-selected") === "true" || el?.checked === true || el?.classList.contains("dx-list-item-selected") || el?.classList.contains("dx-checkbox-checked");
+  function choice(root, label) {
+    const wanted = norm(label);
+    const nodes = all(
+      root,
+      '.dx-list-item,.dx-radiobutton,[role="radio"],[role="checkbox"],label'
+    ).filter((el) => norm(el.textContent) === wanted);
+    const leaf = nodes.filter(
+      (n) => !nodes.some((c) => c !== n && n.contains(c))
+    );
+    const controls = leaf.map(
+      (n) => n.closest(
+        '.dx-list-item,[role="radio"],[role="checkbox"],.dx-radiobutton'
+      ) || n.querySelector('input[type="checkbox"],input[type="radio"]') || n
+    );
+    return unique(controls, "Lựa chọn " + label);
+  }
+  async function choose(find, { guard, signal } = {}) {
+    check(signal);
+    guard();
+    let el = find();
+    if (!writable(el)) fail("WIDGET", "Lựa chọn bị vô hiệu hóa.");
+    if (!selected(el)) el.click();
+    await wait(
+      () => {
+        guard();
+        return selected(find());
+      },
+      { timeout: 5e3, signal, label: "trạng thái chọn" }
+    );
+  }
+  function button(root, text) {
+    const nodes = all(root, 'button,a,[role="button"],.dx-button').filter(
+      (el) => norm(el.textContent) === norm(text) && writable(el)
+    );
+    return unique(
+      nodes.filter((n) => !nodes.some((c) => c !== n && n.contains(c))),
+      "Nút " + text
+    );
+  }
+  function targetUnit(el) {
+    const label = el.id ? all(el.ownerDocument, "label").find((l) => l.htmlFor === el.id) : null;
+    const text = label?.textContent || el.closest(".dx-field,.form-group,td")?.textContent || "";
+    const candidate = text.match(/\(([^()]+)\)\s*$/)?.[1]?.trim() || "";
+    const known = [
+      ...Object.values(CLS_ALERT_CONFIG).map((c) => c.unit),
+      "g/dL",
+      "%",
+      "M/µL",
+      "10^12/L",
+      "10^9/L",
+      "k/µL",
+      "m/ul"
+    ].filter(Boolean);
+    const normalize = (u) => u.replace(/[μµ]/g, "u").replace(/\s/g, "").toLowerCase();
+    return known.some((u) => normalize(u) === normalize(candidate)) ? candidate : "";
+  }
+  function labPlan(context, lab) {
+    if (lab.status === "NO_LAB")
+      return {
+        fields: [
+          {
+            key: "other",
+            names: ALIASES.other,
+            value: "Công dân chưa có kết quả xét nghiệm"
+          }
+        ],
+        missing: [],
+        sources: lab.sources
+      };
+    const fields = [], missing = [];
+    for (const [column, names] of context.fieldMap) {
+      const raw = lab.values[column];
+      if (raw === void 0 || String(raw).trim() === "") {
+        if (column !== "Ure") missing.push(column);
+        continue;
+      }
+      const el = field(context.root, names);
+      const unit = targetUnit(el);
+      const normalized = normalizedLabValue(column, raw, {
+        sourceUnit: lab.values[column + "_UNIT"] || (unit && column !== "S.G" ? CLS_ALERT_CONFIG[column]?.unit || "" : ""),
+        targetUnit: unit || CLS_ALERT_CONFIG[column]?.unit || ""
+      });
+      let value = normalized.write;
+      if (QUALITATIVE_URINE_COLUMNS.includes(column) && normalized.normalized === 0)
+        value = numeric(el) ? "0" : "Negative";
+      fields.push({ key: column, names, value, raw, normalized, unit });
+    }
+    if (lab.values.NIT !== void 0 && String(lab.values.NIT).trim() !== "")
+      fields.unshift({
+        key: "NIT",
+        value: normalizedLabValue("NIT", lab.values.NIT).write,
+        choice: true
+      });
+    else missing.push("NIT");
+    if (!fields.length) fail("DATA", "Dòng nguồn không có chỉ số XN.");
+    return { fields, missing, sources: lab.sources };
+  }
+  function clsFieldRoot(context) {
+    const root = context.root;
+    const heads = all(
+      root,
+      "b,strong,h1,h2,h3,h4,h5,h6,.card-title,.panel-title,legend"
+    ).filter((h) => /^\d+\.\s*\S/.test(h.textContent.trim()));
+    const starts = heads.filter(
+      (h) => norm(h.textContent).includes("kham suc khoe dinh ky")
+    );
+    if (!starts.length) return root;
+    const start = unique(starts, "Khung khám sức khỏe định kỳ");
+    const end = heads[heads.indexOf(start) + 1] || null;
+    const N = start.ownerDocument.defaultView.Node;
+    const inside = (el) => root.contains(el) && !!(start.compareDocumentPosition(el) & N.DOCUMENT_POSITION_FOLLOWING) && (!end || !!(end.compareDocumentPosition(el) & N.DOCUMENT_POSITION_PRECEDING));
+    return {
+      contains: inside,
+      querySelectorAll: (selector) => [...root.querySelectorAll(selector)].filter(inside)
+    };
+  }
+  async function writeDate(find, raw, { guard, signal } = {}) {
+    const wanted = date(raw);
+    guard();
+    check(signal);
+    const getInstance = (el) => {
+      const host = el.closest(".dx-datebox,dx-date-box");
+      if (!host) return null;
+      const w2 = el.ownerDocument.defaultView;
+      try {
+        return w2.DevExpress?.ui?.dxDateBox?.getInstance(host) || w2.jQuery?.(host)?.dxDateBox?.("instance") || null;
+      } catch {
+        return null;
+      }
+    };
+    const instance = getInstance(find());
+    if (!instance)
+      return write(find, find().type === "date" ? wanted : vnDate(wanted), {
+        guard,
+        signal,
+        column: "date"
+      });
+    if (instance.option("readOnly") || instance.option("disabled"))
+      fail("WIDGET", "Ngày khám bị khóa.");
+    const [y, m, d] = wanted.split("-").map(Number);
+    const w = find().ownerDocument.defaultView;
+    instance.option("value", new w.Date(y, m - 1, d));
+    await wait(
+      () => {
+        guard();
+        const value = getInstance(find())?.option("value");
+        if (value && typeof value.getFullYear === "function")
+          return [
+            value.getFullYear(),
+            String(value.getMonth() + 1).padStart(2, "0"),
+            String(value.getDate()).padStart(2, "0")
+          ].join("-") === wanted;
+        try {
+          return date(value) === wanted;
+        } catch {
+          return false;
+        }
+      },
+      { signal, timeout: 5e3, label: "ngày khám trong model datebox" }
+    );
+  }
+
+  // src/rules.js
+  function findingsFor(values, model) {
+    setRulesModel(model);
+    const normalized = { ...values }, issues = [];
+    for (const f of CAN_LAM_SANG_FIELD_MAP) {
+      const raw = values[f.column];
+      if (!present(raw)) {
+        if (f.column !== "Ure")
+          issues.push({
+            column: f.column,
+            label: f.label,
+            value: "",
+            level: "missing",
+            note: "Chưa có chỉ số này trong nguồn; không coi là bình thường."
+          });
+        continue;
+      }
+      try {
+        const unit = CLS_ALERT_CONFIG[f.column]?.unit || "";
+        const n = normalizedLabValue(f.column, raw, {
+          sourceUnit: values[f.column + "_UNIT"] || "",
+          targetUnit: unit
+        });
+        normalized[f.column] = n.write;
+        if (values[f.column + "_UNIT"]) normalized[f.column + "_UNIT"] = unit;
+      } catch {
+        issues.push({
+          column: f.column,
+          label: f.label,
+          value: String(raw),
+          level: "review",
+          note: "Cần xác minh giá trị, đơn vị hoặc mức định tính nguồn."
+        });
+        delete normalized[f.column];
+      }
+    }
+    if (!present(values.NIT))
+      issues.push({
+        column: "NIT",
+        label: "Nitrit",
+        value: "",
+        level: "missing",
+        note: "Chưa có Nitrit trong nguồn."
+      });
+    return [...checkAbnormalResults(normalized), ...issues];
+  }
+  function proposal({
+    model,
+    health,
+    disease,
+    values = null,
+    noLab = false
+  }) {
+    if (!health || !/^loai (i|ii|iii|iv|v)$/.test(norm(health)))
+      fail(
+        "DATA_REVIEW",
+        "Phân loại sức khỏe còn trống/chưa đọc được; không chọn Khác trống và không lưu."
+      );
+    if (disease === null || !String(disease).trim())
+      fail(
+        "DATA_REVIEW",
+        "Chưa đọc được bệnh/tật; không xem dữ liệu trống là bình thường."
+      );
+    const classification = ["M3", "M4"].includes(model) ? classifyBenhTatM34(disease) : classifyBenhTat(disease);
+    if (["unknown", "stop"].includes(classification.type))
+      fail("DATA_REVIEW", "Mã ICD cần kiểm tra theo quy tắc của mẫu.", {
+        classification: classification.type
+      });
+    const findings = values && !noLab ? findingsFor(values, model) : [];
+    if (findings.some((f) => ["review", "urgent", "missing"].includes(f.level)))
+      fail(
+        "DATA_REVIEW",
+        "CLS có cảnh báo cần bác sĩ đánh giá hoặc thiếu bối cảnh."
+      );
+    const labRouting = analyzeReferralDepartments(
+      "",
+      findings.map((f) => ({ ...f, key: f.column }))
+    );
+    const icdParts = classification.type === "specialty" ? classification.text.split(", ") : [];
+    const labParts = labRouting.departments;
+    const aliases = {
+      "Khám Răng": "Răng Hàm Mặt",
+      "Khám Mắt": "Mắt",
+      "Khám Tai Mũi Họng": "Tai Mũi Họng",
+      "Khám Tim mạch": "Nội tim mạch",
+      "Khám Nội tiết": "Nội tiết",
+      "Khám Da liễu": "Da liễu",
+      "Khám Cơ Xương Khớp": "Nội Thần kinh Cơ xương khớp",
+      "Khám Thần kinh": "Nội Thần kinh Cơ xương khớp"
+    };
+    const taken = new Set(icdParts.map((s) => aliases[s] || s));
+    const extras = labParts.filter((s) => !taken.has(s));
+    let text = icdParts.join(", ");
+    if (extras.length)
+      text = [
+        text,
+        buildReferralProposal(
+          buildCombinedReferralObservation("", findings),
+          extras
+        )
+      ].filter(Boolean).join("\n");
+    if (icdParts.length && !extras.length)
+      text += " tại Bệnh viện Đa khoa khu vực Hóc Môn để được khám và tư vấn chi tiết hơn.";
+    if (noLab)
+      text = [text, "Công dân chưa có kết quả xét nghiệm"].filter(Boolean).join("\n");
+    const normal = !text && classification.type === "normal";
+    return {
+      selection: normal ? "Bình thường, hẹn khám định kỳ lần sau" : "Khác",
+      text: normal && model === "M11" ? "Bình thường, hẹn khám định kỳ lần sau" : text,
+      findings,
+      classification: classification.type,
+      noLab
+    };
+  }
+  function combineExisting(existing, incoming, mode = "keep") {
+    const a = String(existing ?? "").trim(), b = String(incoming ?? "").trim();
+    if (!a || norm(a) === norm(b)) return b || a;
+    if (mode === "replace") return b;
+    if (mode === "append") {
+      const lines = a.split("\n");
+      return [
+        ...lines,
+        ...b.split("\n").filter((s) => !lines.some((l) => norm(l) === norm(s)))
+      ].join("\n");
+    }
+    fail(
+      "EXISTING_DATA",
+      "Nội dung đã có khác đề xuất. Chọn Bổ sung/Thay thế có chủ đích hoặc giữ nguyên và xử lý tay."
+    );
+  }
+
+  // src/adapters.js
+  var Adapter = class {
+    constructor({
+      doc = globalThis.document,
+      win = globalThis.window,
+      session = () => null,
+      signal,
+      expected = null,
+      network = null
+    } = {}) {
+      this.network = network;
+      this.doc = doc;
+      this.win = win;
+      this.session = session;
+      this.signal = signal;
+      this.expected = expected;
+    }
+    context(requireIdentity = true) {
+      return resolve(this.doc, this.win.location.href, {
+        session: this.session(),
+        expected: this.expected,
+        requireIdentity
+      });
+    }
+    guard(page) {
+      check(this.signal);
+      const c = this.context();
+      if (page && c.page !== page)
+        fail("CONTEXT", "Tab đã đổi; dừng ghi dữ liệu.");
+      if (this.doc.hidden)
+        fail("TAB_HIDDEN", "Tab bị ẩn; tạm dừng trước thao tác ghi.");
+      return c;
+    }
+    options(page, column = "") {
+      return { guard: () => this.guard(page), signal: this.signal, column };
+    }
+    async navigateTab(page) {
+      let c = this.context();
+      if (c.page === page) return c;
+      const names = page === "cls" ? ["kham can lam sang", "can lam sang"] : ["ket luan", "ket luan kham"];
+      const nodes = all(
+        this.doc,
+        "li[data-item-id],.dx-treeview-item,nav a,aside a"
+      ).filter((el) => names.includes(norm(el.textContent)));
+      const leaf = nodes.filter(
+        (n) => !nodes.some((x) => x !== n && n.contains(x))
+      );
+      unique(leaf, "Sidebar " + page).click();
+      return wait(
+        () => {
+          const c2 = this.context();
+          return c2.page === page ? c2 : false;
+        },
+        { signal: this.signal, label: "tab " + page }
+      );
+    }
+    async open(c) {
+      const ctx = this.context(false);
+      if (ctx.page !== "list") fail("CONTEXT", "Cần bắt đầu từ danh sách.");
+      const row = unique(
+        listRows(ctx).filter((r) => r.case && sameCase(c, r.case)),
+        "Dòng đúng lượt khám"
+      ).row;
+      const directIcons = all(
+        row,
+        'i.fa-pen,i.fa-edit,i.fa-pencil,.dx-icon-edit,i[class*="pencil"],svg[class*="edit"]'
+      );
+      const directActions = [
+        .../* @__PURE__ */ new Set([
+          ...all(row, 'a[title="Sửa"],button[title="Sửa"],a[aria-label="Sửa"]'),
+          ...directIcons.map((i) => i.closest('a,button,[role="button"]')).filter(Boolean)
+        ])
+      ];
+      const useGear = c.model === "M4" || c.model === "M11" && !directActions.length;
+      if (useGear) {
+        const icons = all(
+          row,
+          'i.fa-cog,i.fa-gear,[data-icon="cog"],[data-icon="gear"]'
+        );
+        const buttons = [
+          .../* @__PURE__ */ new Set([
+            ...icons.map((i) => i.closest('button,a,[role="button"]')).filter(Boolean),
+            ...all(
+              row,
+              '[dropdownToggle],[data-toggle="dropdown"],.dropdown-toggle'
+            )
+          ])
+        ];
+        const gear = unique(buttons, "Bánh răng " + c.model);
+        if (gear.getAttribute("aria-expanded") !== "true") gear.click();
+        const edit = await wait(
+          () => {
+            const nodes = all(
+              this.doc,
+              '.dropdown-menu a,.dropdown-menu button,.dx-menu-item,[role="menuitem"]'
+            ).filter(
+              (el) => ["chinh sua", "sua", "edit"].includes(norm(el.textContent))
+            );
+            return nodes.length === 1 ? nodes[0] : false;
+          },
+          { signal: this.signal, label: "menu chỉnh sửa " + c.model }
+        );
+        edit.click();
+      } else {
+        unique(directActions, "Nút mở hồ sơ").click();
+      }
+      this.expected = c;
+      await wait(
+        () => {
+          try {
+            return this.context().page !== "list";
+          } catch (e) {
+            if (["CONTEXT", "IDENTITY", "UI_CHANGED"].includes(e.code))
+              return false;
+            throw e;
+          }
+        },
+        { signal: this.signal, label: "đúng hồ sơ sau mở" }
+      );
+      return this.context();
+    }
+    planRoot(page) {
+      const c = this.guard(page);
+      return page === "cls" ? clsFieldRoot(c) : c.root;
+    }
+    async prepareLab(lab) {
+      await this.navigateTab("cls");
+      const root = () => this.guard("cls").root;
+      const periodic = all(root(), '.dx-list-item,[role="radio"],label').filter(
+        (el) => norm(el.textContent) === "kham dinh ky"
+      );
+      if (periodic.length)
+        await choose(() => choice(root(), "Khám Định Kỳ"), this.options("cls"));
+      const c = this.guard("cls");
+      if (lab.status !== "NO_LAB" && findingsFor(lab.values, c.model).some((f) => f.level === "review"))
+        fail(
+          "DATA_REVIEW",
+          "CLS cần kiểm tra giá trị/đơn vị/bối cảnh theo cấu hình nguồn trước khi điền."
+        );
+      c.root = clsFieldRoot(c);
+      c.fieldMap = CAN_LAM_SANG_FIELD_MAP.map((f) => [f.column, [f.label]]);
+      const plan = labPlan(c, lab);
+      plan.kind = "cls";
+      for (const f of plan.fields) {
+        if (f.choice) {
+          choice(c.root, f.value);
+          continue;
+        }
+        const existing = read(field(c.root, f.names));
+        if (existing.trim() && !equivalent(existing, f.value, f.key) && this.session()?.overwrite !== "replace")
+          fail("EXISTING_DATA", "CLS đã có giá trị khác; không ghi đè âm thầm.");
+      }
+      return plan;
+    }
+    async fillPlan(plan) {
+      const page = plan.kind === "cls" ? "cls" : "conclusion";
+      for (const f of plan.fields) {
+        if (f.choice) {
+          await choose(
+            () => choice(this.planRoot(page), f.value),
+            this.options(page)
+          );
+        } else
+          await write(
+            () => field(this.planRoot(page), f.names),
+            f.value,
+            this.options(page, f.key)
+          );
+      }
+      await this.verifyPlan(plan);
+    }
+    async verifyPlan(plan) {
+      const page = plan.kind === "cls" ? "cls" : "conclusion";
+      const c = this.guard(page);
+      c.root = this.planRoot(page);
+      for (const f of plan.fields) {
+        if (f.choice) {
+          if (!selected(choice(c.root, f.value)))
+            fail("VERIFY", "Trạng thái đề nghị/Nitrit chưa khớp.");
+        } else if (!equivalent(read(field(c.root, f.names)), f.value, f.key))
+          fail("VERIFY", "Đọc lại dữ liệu chưa khớp.");
+      }
+      return true;
+    }
+    async prepareConclusion({
+      values = null,
+      noLab = false,
+      mode = "keep"
+    } = {}) {
+      await this.navigateTab("conclusion");
+      const c = this.guard("conclusion");
+      const p = proposal({
+        model: c.model,
+        health: readLabel(c.root, "health"),
+        disease: readLabel(c.root, "disease"),
+        values,
+        noLab
+      });
+      const fields = [];
+      if (c.model !== "M11") {
+        choice(c.root, p.selection);
+        fields.push({ key: "selection", choice: true, value: p.selection });
+      }
+      if (!p.text) {
+        const previous = field(c.root, ALIASES.recommendation, {
+          optional: true
+        });
+        if (previous && read(previous).trim()) {
+          if (mode !== "replace")
+            fail(
+              "EXISTING_DATA",
+              "Đề nghị đã có nội dung; không chuyển sang Bình thường âm thầm."
+            );
+          fields.push({
+            key: "recommendation",
+            names: ALIASES.recommendation,
+            value: ""
+          });
+        }
+      }
+      if (p.text) {
+        const el = field(c.root, ALIASES.recommendation);
+        fields.push({
+          key: "recommendation",
+          names: ALIASES.recommendation,
+          value: combineExisting(read(el), p.text, mode)
+        });
+      }
+      return { kind: "conclusion", fields, proposal: p };
+    }
+    saveButton() {
+      const c = this.guard();
+      return button(c.root, "Lưu thay đổi");
+    }
+    async backToList() {
+      const model = this.expected?.model || this.context().model;
+      const session = this.session();
+      let url = session?.listUrl;
+      if (model === "M11") url = M11_URL;
+      else if (!url)
+        url = this.win.location.origin + "/app/main/dynamicreport/report/viewer-utility/" + LISTS[model];
+      if (!url || new URL(url).origin !== this.win.location.origin)
+        fail("CONTEXT", "URL danh sách không hợp lệ.");
+      this.win.location.assign(url);
+    }
+    filters() {
+      const c = this.context(false);
+      const keys = ["cccd", "name", "date"];
+      return keys.flatMap((k) => {
+        const input = field(c.root, ALIASES[k], { optional: true });
+        return input ? [{ key: k, value: read(input) }] : [];
+      });
+    }
+    async restoreFilters(filters) {
+      for (const f of filters || []) {
+        const c = this.context(false);
+        const input = field(c.root, ALIASES[f.key], { optional: true });
+        if (!input) fail("UI_CHANGED", "Không khôi phục được bộ lọc danh sách.");
+        if (read(input) !== f.value)
+          await write(
+            () => field(this.context(false).root, ALIASES[f.key]),
+            f.value,
+            {
+              guard: () => {
+                if (this.context(false).page !== "list")
+                  fail("CONTEXT", "Đã rời danh sách.");
+              },
+              signal: this.signal
+            }
+          );
+      }
+    }
+    async search(item, examDate) {
+      const c = this.context(false);
+      if (c.page !== "list") fail("CONTEXT", "Không ở danh sách.");
+      const fresh = () => this.context(false).root;
+      const opts = {
+        guard: () => {
+          check(this.signal);
+          if (this.context(false).page !== "list")
+            fail("CONTEXT", "Đã rời trang tìm kiếm.");
+        },
+        signal: this.signal
+      };
+      const input = () => field(fresh(), ALIASES.cccd);
+      await write(input, item.cccd, opts);
+      const name = field(fresh(), ALIASES.name, { optional: true });
+      if (name && read(name))
+        await write(() => field(fresh(), ALIASES.name), "", opts);
+      const exam = field(fresh(), ALIASES.date, { optional: true });
+      if (examDate && exam)
+        await writeDate(() => field(fresh(), ALIASES.date), examDate, opts);
+      const before = this.signature();
+      let loading = false;
+      let stable = "", since = 0;
+      const operation = this.network?.armRead(item.cccd);
+      button(fresh(), "Xem").click();
+      let rows;
+      try {
+        rows = await wait(
+          () => {
+            const ctx = this.context(false);
+            if (all(
+              ctx.root,
+              '.dx-loadpanel,.loading-overlay,.ngx-spinner-overlay,[aria-busy="true"]'
+            ).length) {
+              loading = true;
+              return false;
+            }
+            if (read(input()).replace(/\s/g, "") !== item.cccd) return false;
+            const rows2 = listRows(ctx);
+            const sig = this.signature();
+            const requests = this.network?.readComplete(operation);
+            if (sig === before && !requests) return false;
+            if (rows2.some((r) => r.error || r.case.cccd !== item.cccd))
+              return false;
+            if (sig !== stable) {
+              stable = sig;
+              since = Date.now();
+              return false;
+            }
+            return Date.now() - since >= 500 ? { rows: rows2 } : false;
+          },
+          {
+            timeout: 3e4,
+            signal: this.signal,
+            label: "kết quả tìm kiếm mới và đúng CCCD"
+          }
+        );
+      } finally {
+        this.network?.clearRead();
+      }
+      return this.candidatesForItem(item, examDate);
+    }
+    candidatesForItem(item, examDate) {
+      const rows = listRows(this.context(false));
+      for (const r of rows) {
+        if (r.error) throw r.error;
+        if (r.case.cccd !== item.cccd)
+          fail("IDENTITY", "Trang tìm kiếm có CCCD khác.");
+        if (item.name && norm(item.name) !== norm(r.case.name))
+          fail("IDENTITY", "Tên trong Excel mâu thuẫn với danh sách.");
+        if (item.dob && r.case.dob && date(item.dob) !== date(r.case.dob))
+          fail("IDENTITY", "Ngày sinh Excel mâu thuẫn.");
+      }
+      return rows.map((r) => r.case).filter(
+        (c) => (!item.date || c.date === date(item.date)) && (!examDate || c.date === date(examDate)) && (!item.visitId || c.visitId === item.visitId) && (!item.model || c.model === item.model)
+      );
+    }
+    signature() {
+      const c = this.context(false);
+      return JSON.stringify(
+        listRows(c).map((r) => r.case ? caseKey(r.case) : "invalid")
+      );
+    }
+    async nextPage() {
+      const c = this.context(false);
+      const next = all(
+        c.root,
+        '.dx-next-button,.pagination [aria-label="Next"],[aria-label="Trang sau"]'
+      ).filter(writable);
+      if (!next.length) {
+        const grid = gridInstance(c.root);
+        let index, pages;
+        try {
+          index = grid?.pageIndex?.();
+          pages = grid?.pageCount?.();
+        } catch {
+        }
+        if (Number.isInteger(index) && pages > index + 1) {
+          const before2 = this.signature();
+          grid.pageIndex(index + 1);
+          await wait(() => this.signature() !== before2, {
+            signal: this.signal,
+            label: "dữ liệu trang grid kế tiếp"
+          });
+          return true;
+        }
+        if (Number.isInteger(index) && Number.isFinite(pages) && index + 1 >= pages)
+          return false;
+        const pager = listMeta(c.root);
+        const selectedPage = all(
+          c.root,
+          ".dx-pages .dx-page.dx-selection,.pagination .active"
+        ).map((n) => Number(n.textContent)).find(Number.isFinite);
+        const current = pager.current || selectedPage;
+        const numeric2 = all(c.root, ".dx-pages .dx-page,.pagination a").filter(writable).filter((n) => Number(n.textContent) === current + 1);
+        if (numeric2.length === 1) {
+          const before2 = this.signature();
+          numeric2[0].click();
+          await wait(() => this.signature() !== before2, {
+            signal: this.signal,
+            label: "trang số tiếp theo"
+          });
+          return true;
+        }
+        if (pager.current && pager.pages && pager.current < pager.pages)
+          fail(
+            "PAGINATION",
+            "Còn trang nhưng không xác định được cách chuyển an toàn."
+          );
+        if (pager.total === null || pager.total > listRows(c).length)
+          fail(
+            "PAGINATION",
+            "Chưa xác minh được đã hết trang của danh sách; không báo hoàn tất toàn bộ."
+          );
+        return false;
+      }
+      const el = unique(next, "Trang sau");
+      const before = this.signature();
+      el.click();
+      await wait(() => this.signature() !== before, {
+        signal: this.signal,
+        label: "trang danh sách tiếp theo"
+      });
+      return true;
+    }
+  };
+  function questionnaire(root) {
+    const candidates = all(
+      root,
+      '.dx-list,.dx-radiogroup,fieldset,[role="radiogroup"],.dx-checkbox,input[type="checkbox"]'
+    );
+    const groups = candidates.filter(
+      (g) => !candidates.some((x) => x !== g && g.contains(x))
+    );
+    const out = [];
+    for (const group of groups) {
+      let key = group.getAttribute("aria-label") || "";
+      const id = group.getAttribute("aria-labelledby");
+      if (id) key = group.ownerDocument.getElementById(id)?.textContent || key;
+      if (!key)
+        key = group.closest("fieldset")?.querySelector(":scope > legend")?.textContent || "";
+      if (!key) {
+        let p = group.parentElement;
+        for (let n = 0; n < 4 && p && root.contains(p); n++, p = p.parentElement) {
+          const labels = all(p, "label,legend,b,strong").filter(
+            (el) => !group.contains(el)
+          );
+          if (labels.length === 1) {
+            key = labels[0].textContent;
+            break;
+          }
+          if (labels.length > 1) break;
+        }
+      }
+      const isCheckbox = group.matches(".dx-checkbox,input[type=checkbox]");
+      if (isCheckbox) {
+        const label = group.getAttribute("aria-label") || group.closest(".dx-checkbox")?.textContent || group.closest("label")?.textContent || group.textContent;
+        const legend = group.closest("fieldset")?.querySelector("legend")?.textContent || key;
+        if (!label?.trim())
+          fail("UI_CHANGED", "Checkbox không có nhãn xác minh được.");
+        key = legend + " | " + label;
+      }
+      if (!key.trim()) fail("UI_CHANGED", "Câu hỏi không có nhãn duy nhất.");
+      const opts = [
+        ...isCheckbox ? [group] : [],
+        ...all(
+          group,
+          '.dx-list-item,.dx-radiobutton,[role="radio"],input[type="radio"],input[type="checkbox"],.dx-checkbox'
+        )
+      ];
+      const leaves = opts.filter(
+        (n) => !opts.some((x) => x !== n && n.contains(x))
+      );
+      const choices = leaves.map((el) => ({
+        value: el.getAttribute("aria-label") || el.closest("label")?.textContent || el.textContent || el.parentElement.textContent,
+        node: el.closest(".dx-list-item,.dx-radiobutton,.dx-checkbox") || el
+      }));
+      out.push({ key: norm(key), choices });
+    }
+    if (new Set(out.map((g) => g.key)).size !== out.length)
+      fail("UI_CHANGED", "Nhãn câu hỏi bị trùng.");
+    return out;
+  }
+  async function fillCurrent(adapter, { mode = "keep" } = {}) {
+    const ctx = adapter.guard();
+    const page = ctx.page;
+    if (!["history", "clinical", "mental", "questions"].includes(page))
+      fail("CONTEXT", "Tác vụ điền hồ sơ chưa hỗ trợ tab hiện tại.");
+    if (!["M2", "M3", "M4", "M5", "M6"].includes(ctx.model))
+      fail("CONTEXT", "Mẫu này không có luồng tự điền hồ sơ trong TD.");
+    if (page === "clinical") return fillClinical(adapter, { mode });
+    const groups = questionnaire(ctx.root);
+    if (!groups.length) fail("UI_CHANGED", "Không tìm thấy các nhóm câu hỏi.");
+    const plan = [];
+    for (const g of groups) {
+      let answer = "";
+      if (page === "questions" && ctx.model === "M4") {
+        const code = g.key.match(/^d\d+(?:\.\d+)*/i)?.[0]?.toUpperCase();
+        answer = M4_HOI_BENH_ANSWER_MAP[code] || "";
+        if (!answer) continue;
+      } else if (page === "mental" && ctx.model === "M2")
+        answer = g.choices.some((c) => norm(c.value) === "hoan toan khong dong y") ? "hoàn toàn không đồng ý" : "không có";
+      else if (page === "history") {
+        answer = ctx.model === "M2" && g.choices.some((c) => norm(c.value) === "khong nho ro") ? "không nhớ rõ" : "không";
+      }
+      const matches = g.choices.filter(
+        (c) => norm(c.value) === norm(answer) || answer === "không" && norm(c.value) === "khong/mot so lan"
+      );
+      if (matches.length !== 1)
+        fail("UI_CHANGED", "Đáp án không duy nhất trong câu hỏi.");
+      if (mode === "keep" && g.choices.some((c) => selected(c.node) && c !== matches[0]))
+        fail(
+          "EXISTING_DATA",
+          "Câu hỏi đã có đáp án khác; cần chọn thay thế có chủ đích."
+        );
+      plan.push({ key: g.key, value: matches[0].value });
+    }
+    if (page === "questions" && ctx.model === "M4") {
+      const required = Object.keys(M4_HOI_BENH_ANSWER_MAP);
+      const found = groups.map((g) => g.key.match(/^d\d+(?:\.\d+)*/i)?.[0]?.toUpperCase()).filter(Boolean);
+      if (required.some((code) => !found.includes(code)))
+        fail(
+          "UI_CHANGED",
+          "Bảng câu hỏi M4 chưa render đầy đủ các mã được nguồn hỗ trợ."
+        );
+    }
+    if (page === "history" && ["M3", "M4", "M5", "M6"].includes(ctx.model) && plan.length < 22)
+      fail(
+        "UI_CHANGED",
+        "Chưa có đủ 22 câu tiền sử; không điền một phần rồi báo xong."
+      );
+    if (!plan.length) fail("UI_CHANGED", "Không lập được kế hoạch điền.");
+    for (const p of plan) {
+      await choose(() => {
+        const c = adapter.guard(page);
+        const group = unique(
+          questionnaire(c.root).filter((g) => g.key === p.key),
+          "Câu hỏi sau render"
+        );
+        return unique(
+          group.choices.filter((o) => norm(o.value) === norm(p.value)),
+          "Đáp án sau render"
+        ).node;
+      }, adapter.options(page));
+    }
+    return { status: "FILLED_NOT_SAVED", fields: plan.length };
+  }
+  async function fillDriverConclusions(adapter, { mode }) {
+    const ctx = adapter.guard("clinical");
+    const labels = all(
+      ctx.root,
+      "label,b,strong,.control-label,.dx-field-item-label-text"
+    ).filter((el) => norm(el.textContent).replace(/[:*]$/, "") === "ket luan");
+    if (!labels.length)
+      fail("UI_CHANGED", "Chưa có trường Kết luận của mẫu lái xe.");
+    const specs = [];
+    for (const label of labels) {
+      const section = label.closest("fieldset,.card,.panel");
+      const title = section && all(section, "legend,h3,h4,.card-title,.panel-title").map((n) => norm(n.textContent)).filter(Boolean);
+      if (!section || title.length !== 1)
+        fail("UI_CHANGED", "Chuyên khoa của dropdown Kết luận chưa duy nhất.");
+      specs.push(title[0]);
+    }
+    if (new Set(specs).size !== specs.length)
+      fail("UI_CHANGED", "Tên chuyên khoa bị trùng.");
+    for (const key of specs) {
+      const locate = () => {
+        const root = adapter.guard("clinical").root;
+        const blocks = all(root, "fieldset,.card,.panel").filter(
+          (s) => all(s, "legend,h3,h4,.card-title,.panel-title").some(
+            (t) => norm(t.textContent) === key
+          )
+        );
+        return field(unique(blocks, "Chuyên khoa lái xe"), ["Kết luận"]);
+      };
+      const existing = read(locate());
+      if (existing.trim() && norm(existing) !== "du dieu kien suc khoe" && mode !== "replace")
+        fail("EXISTING_DATA", "Kết luận chuyên khoa đã có; không tự thay thế.");
+      if (norm(existing) === "du dieu kien suc khoe") continue;
+      adapter.guard("clinical");
+      locate().click();
+      const item = await wait(
+        () => {
+          const items = all(
+            adapter.doc,
+            ".dx-overlay-wrapper .dx-list-item,[role=listbox] [role=option]"
+          ).filter((el) => norm(el.textContent) === "du dieu kien suc khoe");
+          return items.length === 1 ? items[0] : false;
+        },
+        { signal: adapter.signal, label: "Đủ điều kiện sức khỏe" }
+      );
+      adapter.guard("clinical");
+      item.click();
+      await wait(() => norm(read(locate())) === "du dieu kien suc khoe", {
+        signal: adapter.signal,
+        label: "kết luận chuyên khoa đã chọn"
+      });
+    }
+    return specs.length;
+  }
+  async function fillClinical(adapter, { mode }) {
+    const get = () => questionnaire(adapter.guard("clinical").root);
+    const actions = (groups, answer) => groups.filter((g) => g.choices.some((c) => norm(c.value) === norm(answer))).map((g) => ({ key: g.key, value: answer }));
+    const apply = async (p) => {
+      const find = () => {
+        const g = unique(
+          get().filter((g2) => g2.key === p.key),
+          "Câu hỏi lâm sàng sau render"
+        );
+        const match = unique(
+          g.choices.filter((c) => norm(c.value) === norm(p.value)),
+          "Đáp án lâm sàng"
+        );
+        if (mode !== "replace" && g.choices.some((c) => c !== match && selected(c.node)))
+          fail("EXISTING_DATA", "Câu hỏi lâm sàng đã có đáp án khác.");
+        return match.node;
+      };
+      await choose(find, adapter.options("clinical"));
+    };
+    const normal = actions(get(), "Chưa phát hiện bất thường");
+    if (!normal.length)
+      fail("UI_CHANGED", "Chưa có nhóm Chưa phát hiện bất thường.");
+    for (const p of normal) await apply(p);
+    let signature = "", since = 0, classes = [];
+    await wait(
+      async () => {
+        const groups = get();
+        classes = actions(groups, "Loại I");
+        if (!classes.length) return false;
+        const sig = JSON.stringify(classes.map((p) => p.key).sort());
+        if (sig !== signature) {
+          signature = sig;
+          since = 0;
+        }
+        for (const p of classes) {
+          const g = groups.find((g2) => g2.key === p.key);
+          const target = unique(
+            g.choices.filter((c) => norm(c.value) === "loai i"),
+            "Loại I"
+          );
+          if (!selected(target.node)) {
+            await apply(p);
+            since = 0;
+            return false;
+          }
+        }
+        if (!since) since = Date.now();
+        return Date.now() - since >= 400;
+      },
+      {
+        signal: adapter.signal,
+        timeout: 2e4,
+        label: "mọi Loại I đã render và giữ lựa chọn"
+      }
+    );
+    let dropdownCount = 0, refusal = [];
+    const model = adapter.context().model;
+    if (["M5", "M6"].includes(model)) {
+      dropdownCount = await fillDriverConclusions(adapter, { mode });
+      refusal = actions(get(), "Từ chối khám");
+      for (const p of refusal) await apply(p);
+    }
+    const final = get();
+    for (const p of [...normal, ...classes, ...refusal]) {
+      const group = unique(
+        final.filter((g) => g.key === p.key),
+        "Câu hỏi khi kiểm tra cuối"
+      );
+      const target = unique(
+        group.choices.filter((c) => norm(c.value) === norm(p.value)),
+        "Đáp án khi kiểm tra cuối"
+      );
+      if (!selected(target.node))
+        fail("VERIFY", "Đáp án lâm sàng đã bị reset sau render.");
+    }
+    return {
+      status: "FILLED_NOT_SAVED",
+      fields: normal.length + classes.length + dropdownCount + refusal.length
+    };
+  }
+
+  // src/storage.js
+  var STORAGE_KEY = "tro_ly_medinet_v1";
+  var Store = class {
+    constructor(storage = globalThis.sessionStorage) {
+      this.storage = storage;
+      this.data = { schema: 1, checkpoint: null, logs: [] };
+      const saved = storage.getItem(STORAGE_KEY);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          if (parsed.schema === 1 && Array.isArray(parsed.logs))
+            this.data = parsed;
+          else fail("RECOVERY", "Checkpoint không tương thích.");
+        } catch {
+          fail("RECOVERY", "Không đọc được checkpoint. Không tự ghi tiếp.");
+        }
+      }
+    }
+    save() {
+      try {
+        this.storage.setItem(STORAGE_KEY, JSON.stringify(this.data));
+      } catch {
+        fail(
+          "STORAGE",
+          "Không lưu được checkpoint; dừng trước bước ghi tiếp theo."
+        );
+      }
+    }
+    checkpoint(value) {
+      if (arguments.length) {
+        this.data.checkpoint = value;
+        this.save();
+      }
+      return this.data.checkpoint;
+    }
+    log(entry) {
+      this.data.logs.push(entry);
+      this.save();
+    }
+    finalize(entry, key) {
+      const cp = this.data.checkpoint;
+      if (!cp.finished.includes(key)) {
+        const exists = this.data.logs.some(
+          (l) => l.runId === cp.runId && l.case && caseKey(l.case) === key && ["DONE", "NO_LAB_VERIFIED"].includes(l.status)
+        );
+        if (!exists) this.data.logs.push(entry);
+        cp.finished.push(key);
+        this.save();
+      }
+    }
+    completed(c) {
+      return this.data.logs.some(
+        (l) => l.case && l.case.visitId === c.visitId && l.case.date === c.date && l.case.model === c.model && ["DONE", "NO_LAB_VERIFIED"].includes(l.status)
+      );
+    }
+  };
+  async function exclusive(locks, fn) {
+    if (!locks?.request)
+      fail(
+        "LOCK",
+        "Trình duyệt không hỗ trợ Web Locks; batch bị khóa để tránh xử lý chồng tab."
+      );
+    return locks.request(
+      "tro-ly-medinet:one-runner-per-origin",
+      { mode: "exclusive", ifAvailable: true },
+      (lock) => {
+        if (!lock) fail("LOCK", "Một tab khác đang chạy Trợ lý Medinet.");
+        return fn();
+      }
+    );
+  }
+  function compatible(cp, { principal: principal2, origin, now = Date.now() } = {}) {
+    return !!(cp && cp.schema === 1 && cp.owner && cp.owner === principal2 && cp.origin === origin && now - cp.updatedAt < 8 * 36e5);
+  }
+
+  // src/runner.js
+  var TASKS = {
+    fill: "Điền hồ sơ hiện tại — không lưu",
+    cls: "Điền CLS hồ sơ hiện tại — không lưu",
+    batchCls: "Hàng loạt CLS M3/M4 + Kết luận",
+    batchConclusion: "Hàng loạt chỉ Kết luận M2/M11",
+    proposal: "Soạn và điền đề nghị — không lưu"
+  };
+  var Runner = class {
+    constructor({
+      win = globalThis.window,
+      doc = win.document,
+      store = new Store(),
+      labs,
+      network,
+      onChange = () => {
+      },
+      adapterFactory = (opts) => new Adapter(opts),
+      reload = () => win.location.reload()
+    } = {}) {
+      Object.assign(this, {
+        win,
+        doc,
+        store,
+        labs,
+        network,
+        onChange,
+        adapterFactory,
+        reload
+      });
+      this.documentId = uid();
+      this.running = false;
+      this.abort = null;
+    }
+    emit() {
+      this.onChange(this.store.data);
+    }
+    cp() {
+      return this.store.checkpoint();
+    }
+    update(patch) {
+      const cp = { ...this.cp(), ...patch, updatedAt: Date.now() };
+      this.store.checkpoint(cp);
+      this.emit();
+      return cp;
+    }
+    adapter() {
+      return this.adapterFactory({
+        win: this.win,
+        doc: this.doc,
+        session: () => this.cp(),
+        expected: this.cp()?.case,
+        network: this.network,
+        signal: this.abort?.signal
+      });
+    }
+    log(status, reason = "", evidence = {}) {
+      const cp = this.cp();
+      this.store.log({
+        runId: cp.runId,
+        task: cp.task,
+        case: cp.case,
+        lookup: cp.queue?.[cp.queueIndex] || null,
+        step: cp.step,
+        startedAt: cp.stepStartedAt || cp.startedAt,
+        endedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        attempt: cp.attempt || 1,
+        status,
+        reason,
+        sources: cp.lab?.sources || [],
+        evidence
+      });
+      this.emit();
+    }
+    async start({ task, queue = [], examDate = "", overwrite = "keep" } = {}) {
+      if (this.running) fail("RUNNING", "Một runner đang hoạt động.");
+      const old = this.cp();
+      if (old?.saveSent && !old?.saveVerified)
+        fail(
+          "SAVE_UNVERIFIED",
+          "Có lần lưu chưa đối chiếu. Dùng Tiếp tục để đọc lại trước khi bắt đầu phiên mới."
+        );
+      const ctx = resolve(this.doc, this.win.location.href, {
+        session: this.store.data.context,
+        requireIdentity: !task?.startsWith("batch")
+      });
+      if (!TASKS[task]) fail("TASK", "Tác vụ không hợp lệ.");
+      const batch = task.startsWith("batch");
+      if (batch) {
+        if (ctx.page !== "list")
+          fail("CONTEXT", "Hàng loạt cần bắt đầu từ danh sách.");
+        if (task === "batchCls" && !["M3", "M4"].includes(ctx.model))
+          fail("CONTEXT", "CLS hàng loạt chỉ hỗ trợ M3/M4.");
+        if (task === "batchConclusion" && !["M2", "M11"].includes(ctx.model))
+          fail("CONTEXT", "Chỉ kết luận hàng loạt dành cho M2/M11.");
+        if (!principal(this.win))
+          fail(
+            "AUTH_BINDING",
+            "Không đọc được định danh người dùng từ phiên Medinet (abp.session). Chưa thể bảo đảm phục hồi qua reload cùng người dùng."
+          );
+        const supported = task === "batchCls" ? ["M3", "M4"] : ["M2", "M11"];
+        if (queue.some((i) => i.model && !supported.includes(i.model)))
+          fail("CONTEXT", "Excel chứa mẫu ngoài nhóm tác vụ đã chọn.");
+        if (!examDate && !(queue.length && queue.every((i) => i.date)) && !readExamFilter(ctx))
+          fail("DATE", "Cần nhập ngày khám một lần trước khi chạy.");
+      }
+      if (examDate) examDate = date(examDate);
+      else if (batch && readExamFilter(ctx)) examDate = date(readExamFilter(ctx));
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const adapter = this.adapterFactory({
+        win: this.win,
+        doc: this.doc,
+        session: () => null
+      });
+      let filters = [];
+      if (batch) filters = adapter.filters();
+      this.store.checkpoint({
+        schema: 1,
+        sourceOrder: this.labs.order || "AUTO",
+        runId: uid(),
+        owner: principal(this.win),
+        origin: this.win.location.origin,
+        task,
+        model: ctx.model,
+        case: ctx.case || null,
+        listUrl: batch ? this.win.location.href : null,
+        filters,
+        queue: queue.map((i) => ({ ...i, status: "PENDING" })),
+        queueIndex: 0,
+        examDate,
+        overwrite,
+        step: batch ? "LIST" : task === "fill" ? "FILL_CURRENT" : task === "cls" ? "PREPARE_LAB" : "PREPARE_CONCLUSION",
+        active: true,
+        auto: false,
+        startedAt: now,
+        updatedAt: Date.now(),
+        verified: {},
+        finished: [],
+        reviewed: [],
+        planned: [],
+        visitedPages: [],
+        attempt: 0
+      });
+      return this.execute();
+    }
+    pause() {
+      this.update({ active: false, auto: false, paused: true });
+      this.abort?.abort(new Fault("PAUSED", "Đã tạm dừng."));
+    }
+    stop() {
+      this.update({ active: false, auto: false, paused: false, stopped: true });
+      this.abort?.abort(
+        new Fault("STOPPED", "Đã dừng; lần lưu đã gửi vẫn cần đọc lại.")
+      );
+    }
+    async skip(reason = "Người dùng yêu cầu bỏ ca để kiểm tra riêng.") {
+      if (this.running) fail("RUNNING", "Tạm dừng trước khi bỏ ca.");
+      const cp = this.cp();
+      if (!cp?.case) fail("RECOVERY", "Chưa có hồ sơ để bỏ qua.");
+      if (cp.saveSent && !cp.saveVerified)
+        fail("SAVE_UNVERIFIED", "Phải đối chiếu lần lưu đã gửi trước khi bỏ ca.");
+      if (!compatible(cp, {
+        principal: principal(this.win),
+        origin: this.win.location.origin
+      }))
+        fail("RECOVERY", "Phiên không tương thích.");
+      this.update({
+        step: "SKIP_RETURN",
+        skipReason: reason,
+        active: true,
+        auto: false,
+        error: null
+      });
+      return this.execute();
+    }
+    async resume({ automatic = false } = {}) {
+      if (this.running) return;
+      const cp = this.cp();
+      if (!cp) fail("RECOVERY", "Không có checkpoint.");
+      if (!compatible(cp, {
+        principal: principal(this.win),
+        origin: this.win.location.origin
+      }))
+        fail(
+          "RECOVERY",
+          "Checkpoint hết hạn, khác người dùng hoặc khác nguồn ứng dụng; không tiếp tục."
+        );
+      if (automatic && (!cp.active || !cp.auto)) return;
+      if (cp.saveSent && !cp.saveVerified && cp.sentDocument === this.documentId) {
+        this.update({
+          step: "VERIFY_SAVE",
+          active: true,
+          auto: true,
+          paused: false,
+          stopped: false
+        });
+        this.reload();
+        return;
+      }
+      this.labs.order = cp.sourceOrder || "AUTO";
+      this.update({
+        active: true,
+        auto: false,
+        paused: false,
+        stopped: false,
+        error: null
+      });
+      return this.execute();
+    }
+    async execute() {
+      if (this.running) return;
+      this.running = true;
+      this.abort = new AbortController();
+      const body = async () => {
+        try {
+          while (this.cp()?.active) {
+            check(this.abort.signal);
+            const cp = this.cp();
+            if (cp.owner && principal(this.win) !== cp.owner)
+              fail("AUTH", "Người dùng Medinet đã thay đổi.");
+            const yielding = await this.step();
+            if (yielding) break;
+          }
+        } catch (e) {
+          const cp = this.cp();
+          if (!cp) return;
+          const status = cp.saveSent && !cp.saveVerified ? "SAVE_UNVERIFIED" : {
+            AUTH: "AUTH",
+            PAUSED: "PAUSED",
+            STOPPED: "STOPPED",
+            NETWORK: "SOURCE_ERROR",
+            DATA_CONFLICT: "NEEDS_REVIEW",
+            DATA_REVIEW: "NEEDS_REVIEW",
+            IDENTITY: "NEEDS_REVIEW",
+            EXISTING_DATA: "NEEDS_REVIEW"
+          }[e.code] || "TECHNICAL_ERROR";
+          this.log(status, e.message);
+          this.update({
+            active: false,
+            auto: false,
+            error: { code: e.code || "TECHNICAL", message: e.message }
+          });
+        } finally {
+          this.running = false;
+          this.emit();
+        }
+      };
+      try {
+        await exclusive(this.win.navigator.locks, body);
+      } catch (e) {
+        this.update({
+          active: false,
+          error: { code: e.code, message: e.message }
+        });
+        this.running = false;
+        throw e;
+      }
+    }
+    async transition(step, patch = {}) {
+      this.log(
+        "STEP_COMPLETED",
+        "Đã đạt điều kiện chuyển bước " + this.cp().step + " → " + step
+      );
+      this.update({
+        ...patch,
+        step,
+        attempt: 0,
+        stepStartedAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+    async step() {
+      const cp = this.cp(), adapter = this.adapter(), signal = this.abort.signal;
+      this.update({ attempt: (cp.attempt || 0) + 1 });
+      switch (cp.step) {
+        case "FILL_CURRENT": {
+          const result = await fillCurrent(adapter, { mode: cp.overwrite });
+          this.log(
+            "FILLED_NOT_SAVED",
+            "Chỉ điền hồ sơ hiện tại; người dùng kiểm tra và tự lưu.",
+            result
+          );
+          this.update({ active: false });
+          return true;
+        }
+        case "LIST": {
+          await retryRead(
+            () => wait(
+              () => {
+                try {
+                  const c = adapter.context(false);
+                  if (c.page !== "list") return false;
+                  listRows(c);
+                  return true;
+                } catch (e) {
+                  if (["TIMEOUT", "CONTEXT", "UI_CHANGED"].includes(e.code))
+                    return false;
+                  throw e;
+                }
+              },
+              { signal, label: "danh sách sẵn sàng" }
+            ),
+            { signal, onAttempt: (attempt) => this.update({ attempt }) }
+          );
+          await adapter.restoreFilters(cp.filters);
+          await this.transition("SELECT", { case: null });
+          return false;
+        }
+        case "SELECT": {
+          let candidates = [];
+          if (cp.queue.length) {
+            if (cp.queueIndex >= cp.queue.length) {
+              this.update({ active: false, step: "COMPLETE" });
+              return true;
+            }
+            const item = cp.queue[cp.queueIndex];
+            if (item.model && item.model !== adapter.context(false).model) {
+              const url = this.win.location.origin + "/app/main/dynamicreport/report/viewer-utility/" + LISTS[item.model];
+              this.update({
+                model: item.model,
+                listUrl: url,
+                step: "LIST",
+                auto: true
+              });
+              this.win.location.assign(url);
+              return true;
+            }
+            const day = item.date ? vnDate(item.date) : cp.examDate;
+            candidates = await adapter.search(item, day);
+            const pending = (c) => !cp.finished.includes(caseKey(c)) && !(cp.reviewed || []).includes(caseKey(c));
+            const seen = /* @__PURE__ */ new Set();
+            let hops = 0;
+            while (!candidates.some(pending)) {
+              const signature = adapter.signature();
+              if (seen.has(signature) || ++hops > 500)
+                fail(
+                  "PAGINATION",
+                  "Tìm kiếm lặp trang hoặc vượt giới hạn 500 trang."
+                );
+              seen.add(signature);
+              if (!await adapter.nextPage()) break;
+              candidates = adapter.candidatesForItem(item, day);
+            }
+            if (!candidates.length) {
+              const handled = this.store.data.logs.some(
+                (l) => l.runId === cp.runId && l.case?.cccd === item.cccd && (!item.visitId || l.case.visitId === item.visitId) && (!day || l.case.date === date(day)) && ["DONE", "NO_LAB_VERIFIED", "NEEDS_REVIEW"].includes(l.status)
+              );
+              if (!handled)
+                this.log(
+                  "NOT_FOUND",
+                  "Không tìm thấy lượt khám theo bộ lọc; không coi là hoàn tất."
+                );
+              const queue = cp.queue.map(
+                (x, i) => i === cp.queueIndex ? { ...x, status: handled ? "VISITS_RECHECKED" : "NOT_FOUND" } : x
+              );
+              await this.transition("SELECT", {
+                queue,
+                queueIndex: cp.queueIndex + 1
+              });
+              return false;
+            }
+          } else
+            candidates = listRows(adapter.context(false)).map((r) => {
+              if (r.error) throw r.error;
+              return r.case;
+            });
+          this.update({
+            planned: [
+              .../* @__PURE__ */ new Set([...cp.planned || [], ...candidates.map(caseKey)])
+            ]
+          });
+          const next = candidates.find(
+            (c) => !cp.finished.includes(caseKey(c)) && !(cp.reviewed || []).includes(caseKey(c))
+          );
+          if (!next) {
+            if (cp.queue.length) {
+              await this.transition("SELECT", { queueIndex: cp.queueIndex + 1 });
+              return false;
+            }
+            const signature = adapter.signature();
+            if (cp.visitedPages.includes(signature))
+              fail(
+                "PAGINATION",
+                "Danh sách lặp lại; tạm dừng thay vì mở hồ sơ vô hạn."
+              );
+            if (await adapter.nextPage()) {
+              this.update({ visitedPages: [...cp.visitedPages, signature] });
+              return false;
+            }
+            this.update({ active: false, step: "COMPLETE" });
+            return true;
+          }
+          if (cp.examDate && next.date !== cp.examDate && !cp.queue.length)
+            fail("DATE", "Ngày khám trong danh sách khác ngày đã xác nhận.");
+          await this.transition("OPEN", {
+            case: next,
+            verified: {},
+            lab: null,
+            plan: null,
+            saveSent: false,
+            saveVerified: false
+          });
+          return false;
+        }
+        case "OPEN": {
+          await adapter.open(cp.case);
+          await this.transition(
+            cp.task === "batchCls" ? "PREPARE_LAB" : "PREPARE_CONCLUSION"
+          );
+          return false;
+        }
+        case "PREPARE_LAB": {
+          const c = adapter.context();
+          const lab = await retryRead(() => this.labs.match(c.case, { signal }), {
+            signal,
+            onAttempt: (attempt) => this.update({ attempt })
+          });
+          const plan = await adapter.prepareLab(lab);
+          if (cp.task === "batchCls" && plan.missing.length)
+            fail("DATA_REVIEW", "Nguồn CLS thiếu chỉ số bắt buộc; chưa tự lưu.", {
+              missing: plan.missing
+            });
+          await this.transition("FILL_PLAN", { lab, plan });
+          return false;
+        }
+        case "PREPARE_CONCLUSION": {
+          let lab = cp.lab;
+          if (cp.task === "proposal" && !lab) {
+            lab = await this.labs.match(adapter.context().case, { signal });
+            this.update({ lab });
+          }
+          const plan = await adapter.prepareConclusion({
+            values: lab?.values || null,
+            noLab: lab?.status === "NO_LAB",
+            mode: cp.overwrite
+          });
+          await this.transition("FILL_PLAN", { plan });
+          return false;
+        }
+        case "FILL_PLAN": {
+          await adapter.fillPlan(cp.plan);
+          if (!cp.task.startsWith("batch")) {
+            this.log(
+              "FILLED_NOT_SAVED",
+              "Đã điền và đọc lại ô; chưa lưu lên máy chủ.",
+              { fields: cp.plan.fields.length }
+            );
+            this.update({ active: false });
+            return true;
+          }
+          await this.transition("SAVE");
+          return false;
+        }
+        case "SAVE": {
+          if (cp.saveSent && !cp.saveVerified)
+            fail(
+              "SAVE_UNVERIFIED",
+              "Không gửi trùng thao tác lưu chưa xác minh."
+            );
+          await adapter.verifyPlan(cp.plan);
+          const button2 = adapter.saveButton(), operationId = uid();
+          this.network.arm(cp.case, operationId);
+          this.update({
+            step: "SAVE_SENT",
+            saveSent: true,
+            saveVerified: false,
+            sentDocument: this.documentId,
+            operationId,
+            auto: false
+          });
+          check(signal);
+          button2.click();
+          const evidence = await this.network.settle({ signal });
+          this.update({
+            networkEvidence: evidence,
+            step: "VERIFY_SAVE",
+            auto: true
+          });
+          this.reload();
+          return true;
+        }
+        case "SAVE_SENT": {
+          fail(
+            "SAVE_UNVERIFIED",
+            "Lần lưu trước chưa có bằng chứng; Tiếp tục sẽ tải mới để đối chiếu trước khi ghi lại."
+          );
+          break;
+        }
+        case "VERIFY_SAVE": {
+          if (cp.sentDocument === this.documentId)
+            fail(
+              "SAVE_UNVERIFIED",
+              "Phải đọc lại từ tài liệu mới sau tải trang."
+            );
+          await wait(() => this.doc.readyState === "complete", {
+            signal,
+            label: "tải mới hoàn tất"
+          });
+          await adapter.navigateTab(
+            cp.plan.kind === "cls" ? "cls" : "conclusion"
+          );
+          await retryRead(
+            () => wait(
+              async () => {
+                try {
+                  return await adapter.verifyPlan(cp.plan);
+                } catch (e) {
+                  if (["VERIFY", "UI_CHANGED", "CONTEXT"].includes(e.code))
+                    return false;
+                  throw e;
+                }
+              },
+              { signal, label: "dữ liệu đã lưu từ trang tải mới" }
+            ),
+            { signal, attempts: 2 }
+          );
+          const evidence = {
+            ...cp.verified,
+            [cp.plan.kind]: {
+              operationId: cp.operationId,
+              verifiedAt: (/* @__PURE__ */ new Date()).toISOString(),
+              newDocument: true,
+              fields: cp.plan.fields.length,
+              sourceHash: cp.lab?.hash || null
+            }
+          };
+          this.log(
+            "STEP_VERIFIED",
+            "Đã tải mới và đối chiếu đúng lượt khám cùng giá trị dự kiến.",
+            evidence[cp.plan.kind]
+          );
+          this.network.clear();
+          await this.transition(
+            cp.plan.kind === "cls" ? "PREPARE_CONCLUSION" : "RETURN_LIST",
+            { verified: evidence, saveVerified: true, saveSent: false }
+          );
+          return false;
+        }
+        case "RETURN_LIST": {
+          if (!cp.verified.conclusion || cp.task === "batchCls" && !cp.verified.cls)
+            fail("VERIFY", "Thiếu bước đã đối chiếu.");
+          this.update({ step: "VERIFY_LIST", auto: true });
+          await adapter.backToList();
+          return true;
+        }
+        case "VERIFY_LIST": {
+          await wait(
+            () => {
+              const ctx = adapter.context(false);
+              if (ctx.page !== "list") return false;
+              listRows(ctx);
+              return true;
+            },
+            { signal, label: "danh sách sau lưu" }
+          );
+          const key = caseKey(cp.case);
+          if (!cp.finished.includes(key)) {
+            this.store.finalize(
+              {
+                runId: cp.runId,
+                task: cp.task,
+                case: cp.case,
+                lookup: cp.queue?.[cp.queueIndex] || null,
+                step: cp.step,
+                startedAt: cp.startedAt,
+                endedAt: (/* @__PURE__ */ new Date()).toISOString(),
+                attempt: cp.attempt || 1,
+                status: cp.lab?.status === "NO_LAB" ? "NO_LAB_VERIFIED" : "DONE",
+                reason: "Hoàn tất các bước bắt buộc và về danh sách an toàn.",
+                sources: cp.lab?.sources || [],
+                evidence: cp.verified
+              },
+              key
+            );
+            this.emit();
+          }
+          await this.transition("LIST", {
+            case: null,
+            lab: null,
+            plan: null,
+            auto: false
+          });
+          return false;
+        }
+        case "SKIP_RETURN": {
+          this.update({ step: "VERIFY_SKIP_LIST", auto: true });
+          await adapter.backToList();
+          return true;
+        }
+        case "VERIFY_SKIP_LIST": {
+          await wait(
+            () => {
+              const c = adapter.context(false);
+              if (c.page !== "list") return false;
+              listRows(c);
+              return true;
+            },
+            { signal, label: "danh sách sau bỏ ca" }
+          );
+          this.log("NEEDS_REVIEW", cp.skipReason);
+          await this.transition("LIST", {
+            reviewed: [.../* @__PURE__ */ new Set([...cp.reviewed || [], caseKey(cp.case)])],
+            case: null,
+            plan: null,
+            lab: null,
+            auto: false
+          });
+          return false;
+        }
+        case "COMPLETE":
+          this.update({ active: false });
+          return true;
+        default:
+          fail("STATE", "Checkpoint có bước không hợp lệ.");
+      }
+    }
+  };
+  function readExamFilter(ctx) {
+    try {
+      const raw = readLabel(ctx.root, "date");
+      return raw ? date(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // src/network.js
+  function bodyIdentity(body, c) {
+    if (typeof body !== "string") return false;
+    try {
+      const data = JSON.parse(body);
+      let found = false;
+      const walk = (v, depth = 0) => {
+        if (depth > 12 || !v || typeof v !== "object") return;
+        for (const [k, x] of Object.entries(v)) {
+          if (/^(phieukhamid|kskdk_phieukhamid|maphieu|mahosokham|id)$/i.test(k) && [c.visitId, c.routeId].filter(Boolean).includes(String(x)))
+            found = true;
+          else if (typeof x === "object") walk(x, depth + 1);
+        }
+      };
+      walk(data);
+      return found;
+    } catch {
+      const p = new URLSearchParams(body);
+      return [...p].some(
+        ([k, v]) => /^(phieukhamid|kskdk_phieukhamid|maphieu)$/i.test(k) && [c.visitId, c.routeId].includes(v)
+      );
+    }
+  }
+  function related(url, body, c, origin) {
+    let u;
+    try {
+      u = new URL(url, origin);
+    } catch {
+      return false;
+    }
+    if (u.origin !== origin) return false;
+    const ids = [c.visitId, c.routeId].filter(Boolean);
+    const path = u.pathname.split("/");
+    return ids.some((id) => path.includes(id)) || [...u.searchParams].some(
+      ([k, v]) => /phieukhamid|maphieu/i.test(k) && ids.includes(v)
+    ) || bodyIdentity(body, c);
+  }
+  function businessFailure(data) {
+    return !!(data && typeof data === "object" && (data.success === false || data.isSuccess === false || data.error || data.result?.success === false || data.result?.isSuccess === false));
+  }
+  var NetworkTracker = class {
+    constructor(win) {
+      this.win = win;
+      this.active = null;
+      this.readActive = null;
+      this.installed = false;
+      this.count = 0;
+    }
+    install() {
+      if (this.installed) return;
+      this.installed = true;
+      const self = this, w = this.win;
+      this.fetch = w.fetch;
+      this.open = w.XMLHttpRequest.prototype.open;
+      this.send = w.XMLHttpRequest.prototype.send;
+      w.fetch = async function(input, init) {
+        const url = typeof input === "string" ? input : input.url;
+        const method = init?.method || input?.method || "GET";
+        let body = init?.body;
+        const ticket = self.begin(url, method, body);
+        try {
+          const r = await self.fetch.call(this, input, init);
+          if (ticket) {
+            let data = null;
+            try {
+              data = await r.clone().json();
+            } catch {
+            }
+            self.finish(ticket, r.status, businessFailure(data));
+          }
+          return r;
+        } catch (e) {
+          self.finish(ticket, 0, true);
+          throw e;
+        }
+      };
+      w.XMLHttpRequest.prototype.open = function(method, url, ...args) {
+        this.__tlmMeta = { method, url };
+        return self.open.call(this, method, url, ...args);
+      };
+      w.XMLHttpRequest.prototype.send = function(body) {
+        const meta = this.__tlmMeta || {};
+        const ticket = self.begin(meta.url, meta.method, body);
+        if (ticket) {
+          this.addEventListener(
+            "loadend",
+            () => {
+              let data = null;
+              try {
+                data = this.responseType === "json" ? this.response : JSON.parse(this.responseText);
+              } catch {
+              }
+              self.finish(ticket, this.status, businessFailure(data));
+            },
+            { once: true }
+          );
+        }
+        return self.send.call(this, body);
+      };
+    }
+    begin(url, method, body) {
+      const read2 = this.readActive;
+      if (read2 && Date.now() - read2.startedAt < 5e3) {
+        let text = String(url || "") + " " + String(body || "");
+        try {
+          text = decodeURIComponent(text);
+        } catch {
+        }
+        let sameOrigin = false;
+        try {
+          sameOrigin = new URL(url, this.win.location.origin).origin === this.win.location.origin;
+        } catch {
+        }
+        if (sameOrigin && /cccd|dinhdanhcanhan/i.test(text) && new RegExp("(?:^|[^0-9])" + read2.cccd + "(?:$|[^0-9])").test(text)) {
+          const record2 = { id: ++this.count, status: "pending" };
+          read2.records.push(record2);
+          return { op: read2, record: record2 };
+        }
+      }
+      const op = this.active;
+      if (!op || Date.now() - op.startedAt > 5e3 || !/^(POST|PUT|PATCH)$/i.test(method) || !related(url, body, op.case, this.win.location.origin))
+        return null;
+      const record = { id: ++this.count, status: "pending" };
+      op.records.push(record);
+      return { op, record };
+    }
+    finish(ticket, status, failed) {
+      if (!ticket) return;
+      ticket.record.status = status >= 200 && status < 300 && !failed ? "received" : "failed";
+      ticket.record.http = status;
+    }
+    armRead(cccd2) {
+      this.readActive = { cccd: cccd2, startedAt: Date.now(), records: [] };
+      return this.readActive;
+    }
+    readComplete(op) {
+      if (!op) return false;
+      if (op.records.some((r) => r.status === "failed"))
+        fail("NETWORK", "Tìm kiếm trả lỗi; chưa xác nhận danh sách.");
+      return op.records.length > 0 && op.records.every((r) => r.status === "received");
+    }
+    clearRead() {
+      this.readActive = null;
+    }
+    arm(c, operationId) {
+      if (this.active)
+        fail("SAVE_UNVERIFIED", "Một thao tác lưu vẫn chưa được đối chiếu.");
+      this.active = { operationId, case: c, startedAt: Date.now(), records: [] };
+      return this.active;
+    }
+    async settle({ signal, timeout = 6e4 } = {}) {
+      const op = this.active;
+      return wait(
+        () => {
+          if (op.records.some((r) => r.status === "failed"))
+            fail(
+              "SAVE_UNVERIFIED",
+              "Request lưu lỗi hoặc nghiệp vụ trả thất bại."
+            );
+          if (op.records.length && op.records.every((r) => r.status === "received"))
+            return {
+              operationId: op.operationId,
+              requests: op.records.length,
+              http: op.records.map((r) => r.http)
+            };
+          return false;
+        },
+        {
+          signal,
+          timeout,
+          label: "response lưu gắn đúng mã phiếu; cần đọc lại sau tải mới"
+        }
+      );
+    }
+    clear() {
+      this.active = null;
+    }
+    dispose() {
+      if (!this.installed) return;
+      this.win.fetch = this.fetch;
+      this.win.XMLHttpRequest.prototype.open = this.open;
+      this.win.XMLHttpRequest.prototype.send = this.send;
+      this.installed = false;
+      this.clear();
+      this.clearRead();
+    }
+  };
+
+  // src/ui.js
+  function download(blob, name, doc = document) {
+    const url = URL.createObjectURL(blob), a = doc.createElement("a");
+    a.href = url;
+    a.download = name;
+    doc.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1e3);
+  }
+  var Panel = class {
+    constructor({ win, runner, labs }) {
+      Object.assign(this, { win, runner, labs });
+      this.queue = [];
+      this.invalid = [];
+      this.busy = false;
+      this.host = win.document.createElement("div");
+      this.host.id = "tro-ly-medinet";
+      win.document.body.append(this.host);
+      this.root = this.host.attachShadow({ mode: "open" });
+      this.root.innerHTML = `<style>:host{all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483000;font:13px/1.45 system-ui;color:#172b3a}details{width:min(350px,calc(100vw - 24px));background:white;border:1px solid #64748b;border-radius:8px;box-shadow:0 3px 12px #0002}summary{padding:9px;cursor:pointer;background:#e0f2fe;border-radius:8px;font-weight:650}.body{padding:10px;max-height:65vh;overflow:auto}label{display:block;margin:8px 0 3px}select,input,textarea{box-sizing:border-box;width:100%;padding:5px;font:inherit}button{font:inherit;padding:5px 8px;margin:4px 3px 4px 0;cursor:pointer}button:disabled{cursor:default}p{margin:6px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow:auto}#message{border-left:3px solid #0369a1;padding-left:8px}small{display:block;color:#475569}table{border-collapse:collapse}td{border:1px solid #ccd;padding:4px}</style><details><summary>Trợ lý Medinet · <span id="state">Sẵn sàng kiểm tra</span></summary><div class="body"><p id="context"></p><label>Tác vụ<select id="task">${Object.entries(
+        TASKS
+      ).map(([k, v]) => `<option value="${k}">${v}</option>`).join(
+        ""
+      )}</select></label><p id="reason"></p><label>Ngày khám (ngày/tháng/năm)<input id="date" placeholder="dd/mm/yyyy"></label><label>Khi có nội dung khác<select id="mode"><option value="keep">Giữ nguyên — dừng để kiểm tra nếu khác</option><option value="append">Bổ sung đề nghị (CLS vẫn giữ nguyên)</option><option value="replace">Thay thế có chủ đích</option></select></label><label>Ngày trong nguồn CLS<select id="order"><option value="AUTO">Tự kiểm tra — dừng nếu ngày mơ hồ</option><option value="DMY">Nguồn xác nhận dd/mm/yyyy</option><option value="MDY">Nguồn xác nhận mm/dd/yyyy</option></select></label><label>Nhập Excel (.xlsx, mọi sheet)<input id="file" type="file" accept=".xlsx"></label><label>Hoặc danh sách CCCD (mỗi dòng một số)<textarea id="cccd" rows="2"></textarea></label><button id="import">Nạp danh sách</button><button id="clear">Bỏ danh sách</button><p id="summary"></p><button id="start">Bắt đầu</button><button id="pause">Tạm dừng</button><button id="resume">Tiếp tục</button><button id="stop">Dừng</button><button id="skip">Bỏ ca để kiểm tra</button><p id="progress"></p><p id="source"></p><button id="refresh">Làm mới CLS</button><button id="warnings">Xem cảnh báo CLS</button><button id="logs">Xem nhật ký</button><button id="export">Xuất Excel</button><button id="unresolved">Xuất ca chưa hoàn tất</button><button id="diagnostic">Xuất chẩn đoán đã che định danh</button><button id="erase">Xóa dữ liệu phiên trong tab</button><p id="message" role="status"></p><pre id="viewer"></pre><small>Tắt cả 4 script cũ trước khi dùng. Điền hồ sơ/CLS/đề nghị hiện tại không tự lưu. Nhật ký có dữ liệu cá nhân, chỉ lưu/chia sẻ đúng nơi được phép.</small></div></details>`;
+      const click = (id, fn) => this.el(id).addEventListener("click", () => this.action(fn));
+      click(
+        "start",
+        () => runner.start({
+          task: this.el("task").value,
+          queue: this.queue,
+          examDate: this.el("date").value,
+          overwrite: this.el("mode").value
+        })
+      );
+      click("pause", () => runner.pause());
+      click("stop", () => runner.stop());
+      click("resume", () => runner.resume());
+      click("skip", () => runner.skip());
+      click("refresh", async () => {
+        labs.order = this.el("order").value;
+        await labs.load({ force: true });
+        this.message("Đã tải nguồn CLS.");
+        this.refresh();
+      });
+      this.el("order").addEventListener("change", () => {
+        labs.order = this.el("order").value;
+        labs.loadedAt = 0;
+        this.message("Đã đổi quy tắc ngày nguồn; cần tải lại CLS.");
+      });
+      this.el("task").addEventListener("change", () => this.refresh());
+      this.el("file").addEventListener(
+        "change",
+        () => this.action(async () => {
+          if (runner.running)
+            throw new Fault("RUNNING", "Dừng phiên trước khi nạp Excel.");
+          const f = this.el("file").files?.[0];
+          if (!f) return;
+          const r = await readXlsx(f);
+          this.queue = r.valid;
+          this.invalid = r.invalid;
+          this.showSummary();
+          this.message(
+            "Đã đọc Excel. Kiểm tra tóm tắt và ngày khám trước khi Bắt đầu."
+          );
+          this.el("file").value = "";
+        })
+      );
+      click("import", () => {
+        if (runner.running)
+          throw new Fault("RUNNING", "Dừng phiên trước khi đổi nguồn.");
+        const rows = this.el("cccd").value.split(/\n/).filter((s) => s.trim()).map((s) => [s.trim()]);
+        const r = readTable(["CCCD"], rows);
+        this.queue = r.valid;
+        this.invalid = r.invalid;
+        this.showSummary();
+      });
+      click("clear", () => {
+        if (runner.running)
+          throw new Fault("RUNNING", "Dừng phiên trước khi đổi nguồn.");
+        this.queue = [];
+        this.invalid = [];
+        this.showSummary();
+      });
+      click("logs", () => {
+        this.el("viewer").textContent = runner.store.data.logs.map(
+          (l) => `${l.endedAt} · ${l.case?.model || ""} · ${l.case?.visitId || ""} · ${l.step} · ${l.status}
+${l.reason}`
+        ).join("\n");
+      });
+      const exportLogs = (unresolved) => {
+        const logs = runner.store.data.logs;
+        const done = new Set(
+          logs.filter((l) => ["DONE", "NO_LAB_VERIFIED"].includes(l.status)).map(
+            (l) => [l.runId, l.case?.model, l.case?.visitId, l.case?.date].join("|")
+          )
+        );
+        const chosen = unresolved ? logs.filter(
+          (l) => !done.has(
+            [l.runId, l.case?.model, l.case?.visitId, l.case?.date].join(
+              "|"
+            )
+          )
+        ) : logs;
+        download(
+          logWorkbook(chosen),
+          `Tro-ly-Medinet-${unresolved ? "chua-hoan-tat" : "nhat-ky"}.xlsx`,
+          win.document
+        );
+      };
+      click("export", () => exportLogs(false));
+      click("unresolved", () => exportLogs(true));
+      click("warnings", () => {
+        const cp = runner.cp();
+        if (!cp?.lab || !cp?.case)
+          throw new Fault("DATA", "Chưa có nguồn CLS gắn với hồ sơ trong phiên.");
+        const current = resolve(win.document, win.location.href, {
+          session: cp,
+          expected: cp.case,
+          requireIdentity: true
+        });
+        if (current.page === "list")
+          throw new Fault(
+            "CONTEXT",
+            "Mở đúng hồ sơ của báo cáo trước khi xem cảnh báo CLS."
+          );
+        const f = findingsFor(cp.lab.values, cp.case.model);
+        this.el("viewer").textContent = cp.lab.status === "NO_LAB" ? "Công dân chưa có kết quả xét nghiệm" : f.length ? f.map(
+          (x) => `${x.label}: ${x.value} · ${x.level}
+${x.note || x.groupReason || ""}`
+        ).join("\n") : "Các chỉ số đã đọc chưa tạo cảnh báo theo cấu hình nguồn; không suy ra các chỉ số còn thiếu là bình thường.";
+        this.el("viewer").textContent = "Mã phiếu " + cp.case.visitId + " · " + vnDate(cp.case.date) + "\n" + this.el("viewer").textContent;
+      });
+      click("diagnostic", () => {
+        const cp = runner.cp();
+        const r = technicalReport(
+          cp?.error || { message: "Chẩn đoán theo yêu cầu" },
+          {
+            step: cp?.step,
+            url: win.location.href,
+            widgets: [
+              ...win.document.querySelectorAll(
+                ".dx-numberbox,.dx-textarea,.ql-editor"
+              )
+            ].map((n) => n.tagName + ":" + n.className).slice(0, 20)
+          }
+        );
+        download(
+          new Blob([JSON.stringify(r, null, 2)], { type: "application/json" }),
+          "Tro-ly-Medinet-chan-doan.json",
+          win.document
+        );
+      });
+      click("erase", async () => {
+        if (runner.running)
+          throw new Fault("RUNNING", "Dừng tác vụ trước khi xóa.");
+        if (runner.cp()?.saveSent && !runner.cp()?.saveVerified)
+          throw new Fault(
+            "SAVE_UNVERIFIED",
+            "Cần đối chiếu lần lưu trước khi xóa checkpoint."
+          );
+        await labs.clearCache();
+        runner.store.data = { schema: 1, checkpoint: null, logs: [] };
+        runner.store.save();
+        this.queue = [];
+        this.invalid = [];
+        this.showSummary();
+        this.el("viewer").textContent = "";
+        this.message("Đã xóa dữ liệu phiên trong tab.");
+        this.refresh();
+      });
+      this.installDrag();
+      const persisted = runner.cp();
+      if (persisted?.sourceOrder) this.el("order").value = persisted.sourceOrder;
+      this.refresh();
+    }
+    installDrag() {
+      const title = this.root.querySelector("summary");
+      title.style.cursor = "grab";
+      title.title = "Kéo tiêu đề để tránh che nút Medinet";
+      title.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        this.dragCleanup?.();
+        const box = this.host.getBoundingClientRect(), x = event.clientX, y = event.clientY;
+        let moved = false;
+        const move = (e) => {
+          if (Math.abs(e.clientX - x) + Math.abs(e.clientY - y) < 4 && !moved)
+            return;
+          moved = true;
+          this.moved = true;
+          this.host.style.left = Math.max(
+            8,
+            Math.min(this.win.innerWidth - 180, box.left + e.clientX - x)
+          ) + "px";
+          this.host.style.top = Math.max(
+            8,
+            Math.min(this.win.innerHeight - 40, box.top + e.clientY - y)
+          ) + "px";
+          this.host.style.right = "auto";
+          this.host.style.bottom = "auto";
+        };
+        const cleanup = () => {
+          this.win.removeEventListener("pointermove", move);
+          this.win.removeEventListener("pointerup", cleanup);
+          this.win.removeEventListener("pointercancel", cleanup);
+          this.dragCleanup = null;
+        };
+        this.dragCleanup = cleanup;
+        this.win.addEventListener("pointermove", move);
+        this.win.addEventListener("pointerup", cleanup, { once: true });
+        this.win.addEventListener("pointercancel", cleanup, { once: true });
+      });
+      title.addEventListener("click", (e) => {
+        if (this.moved) {
+          e.preventDefault();
+          this.moved = false;
+        }
+      });
+    }
+    dispose() {
+      this.dragCleanup?.();
+    }
+    el(id) {
+      return this.root.getElementById(id);
+    }
+    async action(fn) {
+      try {
+        await fn();
+      } catch (e) {
+        this.message(e.message);
+      }
+      this.refresh();
+    }
+    message(text) {
+      this.el("message").textContent = text;
+    }
+    showSummary() {
+      const s = summarize(this.queue, this.invalid);
+      this.el("summary").textContent = `${s.rows} dòng hợp lệ · ${s.people} người · ${s.visits} lượt đã có mã phiếu/ngày (lượt còn lại sẽ xác minh từ danh sách) · ${s.invalid} dòng cần kiểm tra. Mẫu: ${s.models.join(", ")}. ${s.from ? vnDate(s.from) + "–" + vnDate(s.to) : "Chưa có ngày; dùng ngày xác nhận ở trên"}. Sẽ xử lý toàn bộ dòng hợp lệ; trạng thái từ Excel chỉ để tham khảo.`;
+      if (this.invalid.length)
+        this.el("viewer").textContent = this.invalid.map((i) => `${i.source.sheet || ""}:${i.source.row || ""} ${i.reason}`).join("\n");
+    }
+    refresh() {
+      let c, reason = "";
+      const cp = this.runner.cp();
+      try {
+        c = resolve(this.win.document, this.win.location.href, {
+          session: cp?.case ? cp : this.runner.store.data.context,
+          requireIdentity: false
+        });
+      } catch (e) {
+        reason = e.message;
+      }
+      this.el("context").textContent = c ? `Mẫu ${c.model} · Trang ${c.page}` : "Chưa xác định ngữ cảnh";
+      const task = this.el("task").value;
+      for (const option of this.el("task").options) {
+        let allowed = false;
+        if (c) {
+          if (option.value === "fill")
+            allowed = ["M2", "M3", "M4", "M5", "M6"].includes(c.model) && ["history", "mental", "questions", "clinical"].includes(c.page);
+          if (option.value === "cls")
+            allowed = ["M3", "M4"].includes(c.model) && c.page !== "list";
+          if (option.value === "proposal") allowed = c.page === "conclusion";
+          if (option.value === "batchCls")
+            allowed = ["M3", "M4"].includes(c.model) && c.page === "list";
+          if (option.value === "batchConclusion")
+            allowed = ["M2", "M11"].includes(c.model) && c.page === "list";
+        }
+        option.disabled = !allowed;
+      }
+      const opt = [...this.el("task").options].find((o) => o.value === task);
+      this.el("reason").textContent = reason || (!opt || opt.disabled ? "Tác vụ chưa phù hợp trang hiện tại. Chọn tác vụ đang được bật." : "Kiểm tra nguồn/ngày rồi bấm Bắt đầu.");
+      this.el("start").disabled = this.runner.running || !c || opt?.disabled;
+      this.el("pause").disabled = !this.runner.running;
+      this.el("stop").disabled = !cp?.active;
+      this.el("skip").disabled = this.runner.running || !cp?.case || !!(cp.saveSent && !cp.saveVerified);
+      this.el("resume").disabled = this.runner.running || !cp || cp.step === "COMPLETE";
+      const logs = this.runner.store.data.logs;
+      const latest = /* @__PURE__ */ new Map();
+      for (const l of logs)
+        if ([
+          "DONE",
+          "NO_LAB_VERIFIED",
+          "NEEDS_REVIEW",
+          "TECHNICAL_ERROR",
+          "SAVE_UNVERIFIED",
+          "SOURCE_ERROR",
+          "AUTH"
+        ].includes(l.status)) {
+          const key = [
+            l.runId,
+            l.case?.model,
+            l.case?.visitId,
+            l.case?.date,
+            l.lookup?.cccd
+          ].join("|");
+          latest.set(key, l);
+        }
+      const outcomes = [...latest.values()];
+      const final = logs.filter(
+        (l) => ["DONE", "NO_LAB_VERIFIED"].includes(l.status)
+      );
+      this.el("progress").textContent = `Tổng lượt đã nhận diện: ${cp?.planned?.length || 0} · Bước: ${cp?.step || "Chưa chạy"} · Lượt: ${cp?.case?.visitId || "—"} · Hoàn tất: ${final.filter((l) => l.status === "DONE").length} · Thiếu XN đã xác minh: ${final.filter((l) => l.status === "NO_LAB_VERIFIED").length} · Cần kiểm tra: ${outcomes.filter((l) => l.status === "NEEDS_REVIEW").length} · Lỗi: ${outcomes.filter((l) => l.status === "TECHNICAL_ERROR").length}`;
+      this.el("state").textContent = this.runner.running ? "Đang chạy" : cp?.error ? "Đã tạm dừng" : cp?.step === "COMPLETE" ? "Đã kết thúc" : "Chờ thao tác";
+      this.el("source").textContent = this.labs.loadedAt ? "Nguồn CLS đã tải lúc: " + new Date(this.labs.loadedAt).toLocaleString("vi-VN") : "Nguồn CLS: chưa tải";
+      if (cp?.error) this.message(cp.error.message);
+    }
+  };
+
+  // src/main.js
+  function boot(win = window) {
+    if (win.top !== win || win.__troLyMedinet) return;
+    const service = {};
+    win.__troLyMedinet = service;
+    const store = new Store(win.sessionStorage), labs = new LabData({ fetcher: win.fetch.bind(win) }), network = new NetworkTracker(win);
+    network.install();
+    let panel;
+    const runner = new Runner({
+      win,
+      store,
+      labs,
+      network,
+      onChange: () => panel?.refresh()
+    });
+    panel = new Panel({ win, runner, labs });
+    Object.assign(service, { runner, panel, network, labs });
+    let pending = null;
+    const schedule = () => {
+      clearTimeout(pending);
+      pending = setTimeout(() => panel.refresh(), 150);
+    };
+    const push = win.history.pushState, replace = win.history.replaceState;
+    win.history.pushState = function(...args) {
+      const value = push.apply(this, args);
+      schedule();
+      return value;
+    };
+    win.history.replaceState = function(...args) {
+      const value = replace.apply(this, args);
+      schedule();
+      return value;
+    };
+    win.addEventListener("popstate", schedule);
+    const capture = (event) => {
+      try {
+        const c = resolve(win.document, win.location.href, {
+          requireIdentity: false
+        });
+        if (c.page !== "list" || !principal(win)) return;
+        const action = event.target.closest("a,button,[role=button]");
+        if (!action) return;
+        const match = listRows(c).find((r) => r.case && r.row.contains(action));
+        if (!match) return;
+        store.data.context = {
+          origin: win.location.origin,
+          owner: principal(win),
+          case: match.case,
+          updatedAt: Date.now()
+        };
+        store.save();
+      } catch {
+      }
+    };
+    win.document.addEventListener("click", capture, true);
+    const observer = new win.MutationObserver(schedule);
+    const content = win.document.querySelector('main,[role="main"],.content');
+    const root = content?.parentElement || win.document.body;
+    observer.observe(root, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["hidden", "aria-hidden", "aria-busy"]
+    });
+    service.dispose = () => {
+      observer.disconnect();
+      win.document.removeEventListener("click", capture, true);
+      clearTimeout(pending);
+      win.removeEventListener("popstate", schedule);
+      win.history.pushState = push;
+      win.history.replaceState = replace;
+      panel.dispose();
+      network.dispose();
+    };
+    win.addEventListener("pagehide", service.dispose, { once: true });
+    labs.bindCache = () => {
+      const owner = principal(win);
+      if (owner !== labs.cacheOwner) {
+        labs.loadedAt = 0;
+        labs.cache = owner ? new SourceCache(win.indexedDB, "DATA|" + owner) : null;
+        labs.cacheOwner = owner;
+      }
+    };
+    labs.bindCache();
+    const cp = store.checkpoint();
+    if (cp?.active && cp.auto)
+      wait(() => principal(win), {
+        timeout: 3e4,
+        label: "phiên đăng nhập để kiểm tra checkpoint"
+      }).then(() => runner.resume({ automatic: true })).catch((e) => panel.message(e.message));
+    return service;
+  }
+  if (typeof window !== "undefined" && !globalThis.__MEDINET_TEST__) boot();
+})();
