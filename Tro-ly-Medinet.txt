@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trợ lý Medinet
 // @namespace    VietsDragon/AutoFixMediNet
-// @version      1.0.2
+// @version      1.0.3
 // @description  Tích hợp điền hồ sơ, CLS và kết luận; xác minh đúng lượt, checkpoint và đọc lại sau lưu.
 // @author       Trần Xuân Cường; tích hợp theo yêu cầu người dùng
 // @match        https://quanlyskcd.medinet.org.vn/*
@@ -1898,6 +1898,22 @@
   };
 
   // src/tasks.js
+  var PAGE_NAMES = {
+    admin: "Thông tin hành chính",
+    list: "Danh sách",
+    history: "Tiền sử",
+    mental: "Đánh giá sức khỏe tâm thần",
+    questions: "Hỏi bệnh và khám lâm sàng",
+    clinical: "Thông tin khám",
+    cls: "Cận lâm sàng",
+    conclusion: "Kết luận"
+  };
+  function actionGuidance(context) {
+    if (context?.page !== "admin")
+      return "Mở hồ sơ hoặc danh sách được hỗ trợ để dùng AUTO.";
+    const tabs = ["M3", "M4"].includes(context.model) ? "Tiền sử, Thông tin khám hoặc Cận lâm sàng" : context.model === "M11" ? "Kết luận" : "Tiền sử hoặc Thông tin khám";
+    return `Trang Thông tin hành chính không có tác vụ AUTO. Chuyển sang ${tabs} để sử dụng.`;
+  }
   function actionsFor(context) {
     if (!context) return [];
     const { model, page } = context;
@@ -1918,7 +1934,7 @@
   }
   function operationFor(context) {
     if (!actionsFor(context).some((a) => a.value === "auto"))
-      fail("CONTEXT", "Mở mục được AUTO hỗ trợ trên hồ sơ trước khi chạy.");
+      fail("CONTEXT", actionGuidance(context));
     if (context.page === "cls") return "cls";
     if (context.page === "conclusion") return "proposal";
     return "fill";
@@ -1975,14 +1991,22 @@
     if (path.includes("/viewer-utility/"))
       return { model: "", kind: "unknown", report: "" };
     const models = [];
+    const navigation = path.match(
+      /^\/nav_group\/([^/]+)\/app\/main\/dynamicform\/viewer\/([^/]+)\/[^/]+$/i
+    );
+    const adultGroup = navigation?.[1].toLowerCase() === "kskdk_thongtinkhamtren18";
+    if (adultGroup) models.push("M3");
     if (/(?:^|\/)KSKD18_KetLuanKham(?:\/|$)/i.test(path)) models.push("M2");
     if (/kskdk_NguoiCaoTuoi|KNCT_|mauphieunct/i.test(path)) models.push("M4");
     if (/(?:^|[_/])M11(?:[_/]|$)/i.test(path)) models.push("M11");
+    const modelSet = [...new Set(models)];
+    if (modelSet.length > 1)
+      fail("CONTEXT", "Nhóm điều hướng và mẫu biểu trong URL không thống nhất.");
     return {
-      model: models.length === 1 ? models[0] : "",
+      model: modelSet[0] || "",
       kind: "detail",
       report: "",
-      page: /(?:^|\/)KSKD18_KetLuanKham(?:\/|$)/i.test(path) ? "conclusion" : /(?:^|\/)(?:KSKDK_Phieu_CanLamSang|KNCT_PhieuCLS(?:_CanLamSang)?)(?:\/|$)/i.test(
+      page: adultGroup && navigation[2] === "KSKT18_TTHC" ? "admin" : /(?:^|\/)KSKD18_KetLuanKham(?:\/|$)/i.test(path) ? "conclusion" : /(?:^|\/)(?:KSKDK_Phieu_CanLamSang|KNCT_PhieuCLS(?:_CanLamSang)?)(?:\/|$)/i.test(
         path
       ) ? "cls" : ""
     };
@@ -2127,7 +2151,7 @@
       root,
       "label,b,strong,.control-label,.dx-field-item-label-text"
     ).map((l) => headerKey(l.textContent));
-    let page = route.kind === "list" ? "list" : "";
+    let page = route.kind === "list" ? "list" : route.page === "admin" ? "admin" : "";
     if (!page) {
       const primary = pageHeadings(root, "h1,h2,.hidden-web-title,.page-title");
       const titles = primary.length ? primary : headings;
@@ -3636,12 +3660,13 @@
           "SAVE_UNVERIFIED",
           "Có lần lưu chưa đối chiếu. Dùng Tiếp tục để đọc lại trước khi bắt đầu phiên mới."
         );
-      const ctx = this.context(!task?.startsWith("batch"));
+      let ctx = this.context(false);
       if (task === "auto") task = operationFor(ctx);
       if (!TASKS[task] && !["fill", "cls", "proposal"].includes(task))
         fail("TASK", "Tác vụ không hợp lệ.");
       if (!task.startsWith("batch") && operationFor(ctx) !== task)
         fail("CONTEXT", "Tác vụ không khớp mục đang mở.");
+      if (!task.startsWith("batch")) ctx = this.context(true);
       if (task === "proposal" && (!referral?.text?.trim() || !sameCase(referral.case, ctx.case)))
         fail(
           "CONTEXT",
@@ -4610,16 +4635,12 @@ ${x.note || x.groupReason || ""}`
       return this.runner.context(requireIdentity);
     }
     start() {
-      const current = this.context();
+      const current = this.context(false);
       const action = actionsFor(current).find(
         (a) => a.value === this.el("task").value
       );
-      if (!action)
-        throw new Fault(
-          "CONTEXT",
-          "Mục đang mở đã thay đổi; kiểm tra lại trước khi chạy."
-        );
-      if (current.page === "conclusion") return this.openReferral(current);
+      if (!action) throw new Fault("CONTEXT", actionGuidance(current));
+      if (current.page === "conclusion") return this.openReferral(this.context());
       return this.runner.start({
         task: action.value,
         queue: current.page === "list" ? this.queue : [],
@@ -4811,7 +4832,7 @@ ${x.note || x.groupReason || ""}`
       } catch (e) {
         reason = e.message;
       }
-      this.el("context").textContent = c ? `Mẫu ${c.model} · Trang ${c.page}` : "Chưa xác định ngữ cảnh";
+      this.el("context").textContent = c ? `Mẫu ${c.model} · Trang ${PAGE_NAMES[c.page] || c.page}` : "Chưa xác định ngữ cảnh";
       const actions = actionsFor(c), oldTask = this.el("task").value;
       this.el("task").replaceChildren(
         ...actions.map((a) => {
@@ -4828,10 +4849,10 @@ ${x.note || x.groupReason || ""}`
       const batch = c?.page === "list" && !!action;
       this.el("batch-controls").hidden = !batch;
       this.el("start").textContent = action?.label || "AUTO";
-      this.el("reason").textContent = reason || (!action ? "Mở hồ sơ hoặc danh sách được hỗ trợ để dùng AUTO." : batch ? this.queue.length ? `Chạy ${this.queue.length} dòng đã nạp trong khoảng ngày trên Medinet.` : "Chạy các lượt trong danh sách Medinet đã lọc." : c.page === "conclusion" ? "Bấm Soạn đề nghị khám để xem, chọn khoa và điền nội dung." : "Bấm AUTO để xử lý mục đang mở như Auto KSK TD.");
+      this.el("reason").textContent = reason || (!action ? actionGuidance(c) : batch ? this.queue.length ? `Chạy ${this.queue.length} dòng đã nạp trong khoảng ngày trên Medinet.` : "Chạy các lượt trong danh sách Medinet đã lọc." : c.page === "conclusion" ? "Bấm Soạn đề nghị khám để xem, chọn khoa và điền nội dung." : "Bấm AUTO để xử lý mục đang mở như Auto KSK TD.");
       this.el("start").disabled = this.runner.running || !action;
-      this.el("usage").textContent = batch ? "Tắt cả 4 script cũ. Luồng hàng loạt điền, lưu và đối chiếu từng lượt." : "Tắt cả 4 script cũ. AUTO điền mục đang mở; kiểm tra rồi bấm Lưu thay đổi trên Medinet như script TD gốc.";
-      const hasCls = ["M3", "M4"].includes(c?.model);
+      this.el("usage").textContent = c?.page === "admin" ? "" : batch ? "Tắt cả 4 script cũ. Luồng hàng loạt điền, lưu và đối chiếu từng lượt." : "Tắt cả 4 script cũ. AUTO điền mục đang mở; kiểm tra rồi bấm Lưu thay đổi trên Medinet như script TD gốc.";
+      const hasCls = ["M3", "M4"].includes(c?.model) && c?.page !== "admin";
       this.el("cls-controls").hidden = !hasCls;
       this.el("order-control").hidden = !hasCls;
       if (this.referralCase && !this.el("referral").hidden) {
@@ -4917,15 +4938,26 @@ ${x.note || x.groupReason || ""}`
         const c = resolve(win.document, win.location.href, {
           requireIdentity: false
         });
-        if (c.page !== "list" || !principal(win)) return;
-        const action = event.target.closest("a,button,[role=button]");
-        if (!action) return;
-        const match = listRows(c).find((r) => r.case && r.row.contains(action));
-        if (!match) return;
+        if (!principal(win)) return;
+        let currentCase;
+        if (c.page === "list") {
+          const action = event.target.closest("a,button,[role=button]");
+          if (!action) return;
+          currentCase = listRows(c).find(
+            (r) => r.case && r.row.contains(action)
+          )?.case;
+        } else {
+          const action = event.target.closest(
+            "li[data-item-id],.dx-treeview-item,nav a,aside a"
+          );
+          if (!action || action.closest("#tro-ly-medinet")) return;
+          currentCase = runner.context(true).case;
+        }
+        if (!currentCase) return;
         store.data.context = {
           origin: win.location.origin,
           owner: principal(win),
-          case: match.case,
+          case: currentCase,
           updatedAt: Date.now()
         };
         store.save();
