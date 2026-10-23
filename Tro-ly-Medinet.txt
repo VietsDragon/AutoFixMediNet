@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trợ lý Medinet
 // @namespace    VietsDragon/AutoFixMediNet
-// @version      1.0.1
+// @version      1.0.2
 // @description  Tích hợp điền hồ sơ, CLS và kết luận; xác minh đúng lượt, checkpoint và đọc lại sau lưu.
 // @author       Trần Xuân Cường; tích hợp theo yêu cầu người dùng
 // @match        https://quanlyskcd.medinet.org.vn/*
@@ -1968,20 +1968,23 @@
   }
   function routeInfo(url) {
     const u = new URL(url), path = decodeURIComponent(u.pathname).replace(/\/$/, "");
-    const matches = Object.entries(LISTS).filter(
-      ([, marker]) => path.endsWith("/" + marker)
-    );
+    const routes = [...Object.entries(LISTS), ["M3", "KSKDK_DanhSach_KSK_M3"]];
+    const matches = routes.filter(([, marker]) => path.endsWith("/" + marker));
     if (matches.length === 1)
       return { model: matches[0][0], kind: "list", report: matches[0][1] };
     if (path.includes("/viewer-utility/"))
       return { model: "", kind: "unknown", report: "" };
     const models = [];
+    if (/(?:^|\/)KSKD18_KetLuanKham(?:\/|$)/i.test(path)) models.push("M2");
     if (/kskdk_NguoiCaoTuoi|KNCT_|mauphieunct/i.test(path)) models.push("M4");
     if (/(?:^|[_/])M11(?:[_/]|$)/i.test(path)) models.push("M11");
     return {
       model: models.length === 1 ? models[0] : "",
       kind: "detail",
-      report: ""
+      report: "",
+      page: /(?:^|\/)KSKD18_KetLuanKham(?:\/|$)/i.test(path) ? "conclusion" : /(?:^|\/)(?:KSKDK_Phieu_CanLamSang|KNCT_PhieuCLS(?:_CanLamSang)?)(?:\/|$)/i.test(
+        path
+      ) ? "cls" : ""
     };
   }
   function modelFromHeading(t) {
@@ -1993,7 +1996,7 @@
       set.add("M" + m[1]);
     if (n.includes("duoi 18 tuoi")) set.add("M2");
     if (n.includes("nguoi cao tuoi")) set.add("M4");
-    if (/18\s*-\s*59/.test(n)) set.add("M3");
+    if (/18\s*[-–—]\s*59/.test(n)) set.add("M3");
     return [...set];
   }
   var VALUE_LABELS = "label,b,strong,span,p,div,h3,h4,h5,.control-label,.dx-field-item-label-text,dt,th";
@@ -2068,15 +2071,21 @@
     const s = win.abp?.session;
     return s?.userId != null ? `${s.tenantId ?? ""}:${s.userId}` : null;
   }
+  function pageHeadings(root, selector = "h1,h2,h3,.hidden-web-title,.page-title,.card-title,legend") {
+    return [...root.querySelectorAll(selector)].filter((el) => {
+      if (visible(el)) return true;
+      return el.matches(".hidden-web-title") && !el.closest('[hidden],[aria-hidden="true"],.dx-state-invisible') && visible(el.parentElement);
+    }).map((el) => norm(el.textContent));
+  }
   function resolve(doc, url, { session = null, expected = null, requireIdentity = false } = {}) {
     if (all(doc, 'input[type="password"]').length)
       fail("AUTH", "Mất đăng nhập; phiên đã tạm dừng.");
     const root = activeRoot(doc);
     const route = routeInfo(url);
-    const headings = all(
+    const headings = pageHeadings(
       root,
       "h1,h2,h3,.hidden-web-title,.page-title,.card-title,legend"
-    ).map((h) => norm(h.textContent));
+    );
     const candidates = new Set(route.model ? [route.model] : []);
     for (const h of headings)
       for (const m of modelFromHeading(h)) {
@@ -2089,9 +2098,23 @@
     if (candidates.size > 1)
       fail("CONTEXT", "URL và tiêu đề không thống nhất về mẫu.");
     let model = [...candidates][0] || "";
-    if (!model && session?.case && session.origin === new URL(url).origin && (!session.owner || session.owner === principal(doc.defaultView)) && (!session.updatedAt || Date.now() - session.updatedAt < 8 * 36e5)) {
-      const now = readIdentity(root, url, session.case.model);
-      if (sameCase(session.case, now)) model = session.case.model;
+    if (!model) {
+      const transfers = Array.isArray(session) ? session : [session];
+      const verifiedModels = /* @__PURE__ */ new Set();
+      for (const transfer of transfers) {
+        if (!transfer?.case || transfer.origin !== new URL(url).origin || transfer.owner && transfer.owner !== principal(doc.defaultView) || transfer.updatedAt && Date.now() - transfer.updatedAt >= 8 * 36e5)
+          continue;
+        try {
+          const now = readIdentity(root, url, transfer.case.model);
+          if (sameCase(transfer.case, now))
+            verifiedModels.add(transfer.case.model);
+        } catch (error) {
+          if (!["IDENTITY", "DATE", "CCCD"].includes(error.code)) throw error;
+        }
+      }
+      if (verifiedModels.size > 1)
+        fail("CONTEXT", "Các phiên đã xác minh không thống nhất về mẫu.");
+      model = [...verifiedModels][0] || "";
     }
     if (model && !Object.keys(LISTS).includes(model))
       fail("CONTEXT", "Mẫu hồ sơ này chưa có triển khai trong bốn nguồn.");
@@ -2106,12 +2129,10 @@
     ).map((l) => headerKey(l.textContent));
     let page = route.kind === "list" ? "list" : "";
     if (!page) {
-      const primary = all(root, "h1,h2,.hidden-web-title,.page-title").map(
-        (h) => norm(h.textContent)
-      );
+      const primary = pageHeadings(root, "h1,h2,.hidden-web-title,.page-title");
       const titles = primary.length ? primary : headings;
-      const cls = titles.some((h) => /can lam sang|ket qua xet nghiem/.test(h)) && labels.some((l) => /so luong hc|huyet sac to/.test(l));
-      const conclusion = titles.some((h) => h.includes("ket luan")) && labels.some((l) => aliasKey(l) === "recommendation");
+      const cls = (route.page === "cls" || titles.some((h) => /can lam sang|ket qua xet nghiem/.test(h))) && labels.some((l) => /so luong hc|huyet sac to/.test(l));
+      const conclusion = (route.page === "conclusion" || titles.some((h) => h.includes("ket luan"))) && labels.some((l) => aliasKey(l) === "recommendation");
       if (cls && conclusion)
         fail("CONTEXT", "Hai vùng CLS và Kết luận cùng hoạt động.");
       if (cls) page = "cls";
@@ -3561,6 +3582,12 @@
     cp() {
       return this.store.checkpoint();
     }
+    context(requireIdentity = false) {
+      return resolve(this.doc, this.win.location.href, {
+        session: [this.cp(), this.store.data.context],
+        requireIdentity
+      });
+    }
     update(patch) {
       const cp = { ...this.cp(), ...patch, updatedAt: Date.now() };
       this.store.checkpoint(cp);
@@ -3609,10 +3636,7 @@
           "SAVE_UNVERIFIED",
           "Có lần lưu chưa đối chiếu. Dùng Tiếp tục để đọc lại trước khi bắt đầu phiên mới."
         );
-      const ctx = resolve(this.doc, this.win.location.href, {
-        session: this.store.data.context,
-        requireIdentity: !task?.startsWith("batch")
-      });
+      const ctx = this.context(!task?.startsWith("batch"));
       if (task === "auto") task = operationFor(ctx);
       if (!TASKS[task] && !["fill", "cls", "proposal"].includes(task))
         fail("TASK", "Tác vụ không hợp lệ.");
@@ -4583,11 +4607,7 @@ ${x.note || x.groupReason || ""}`
       this.refresh();
     }
     context(requireIdentity = true) {
-      const cp = this.runner.cp();
-      return resolve(this.win.document, this.win.location.href, {
-        session: cp?.case ? cp : this.runner.store.data.context,
-        requireIdentity
-      });
+      return this.runner.context(requireIdentity);
     }
     start() {
       const current = this.context();
@@ -4787,10 +4807,7 @@ ${x.note || x.groupReason || ""}`
       let c, reason = "";
       const cp = this.runner.cp();
       try {
-        c = resolve(this.win.document, this.win.location.href, {
-          session: cp?.case ? cp : this.runner.store.data.context,
-          requireIdentity: false
-        });
+        c = this.context(false);
       } catch (e) {
         reason = e.message;
       }
